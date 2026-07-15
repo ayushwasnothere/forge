@@ -5,8 +5,8 @@
   "type": "module",
   "workspaces": ["apps/*", "packages/*"],
   "scripts": {
-    "dev": "bun --filter @forge/cli dev",
-    "start": "bun --filter @forge/cli start",
+    "dev": "bun --watch apps/cli/src/index.ts",
+    "start": "bun apps/cli/src/index.ts",
     "check": "bun run lint && bun run typecheck && bun run test",
     "lint": "biome check .",
     "format": "biome format --write .",

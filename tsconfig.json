@@ -1,37 +1,22 @@
 {
   "compilerOptions": {
-    "ignoreDeprecations": "6.0",
     "target": "ESNext",
-    "lib": [
-      "ESNext"
-    ],
+    "lib": ["ESNext"],
     "module": "Preserve",
     "moduleResolution": "Bundler",
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
     "skipLibCheck": true,
-    "types": [
-      "bun"
-    ],
+    "types": ["bun"],
     "resolveJsonModule": true,
     "noEmit": true,
     "baseUrl": ".",
     "paths": {
-      "@forge/types": [
-        "packages/types/src/index.ts"
-      ],
-      "@forge/events": [
-        "packages/events/src/index.ts"
-      ],
-      "@forge/runtime": [
-        "packages/runtime/src/index.ts"
-      ]
+      "@forge/types": ["packages/types/src/index.ts"],
+      "@forge/events": ["packages/events/src/index.ts"],
+      "@forge/runtime": ["packages/runtime/src/index.ts"]
     }
   },
-  "include": [
-    "apps/**/*.ts",
-    "packages/**/*.ts",
-    "vitest.config.ts"
-  ]
+  "include": ["apps/**/*.ts", "packages/**/*.ts", "vitest.config.ts"]
 }

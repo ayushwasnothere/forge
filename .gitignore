@@ -6,3 +6,5 @@ coverage/
 dist/
 .forge/
 *.log
+context.md
+AGENTS.md

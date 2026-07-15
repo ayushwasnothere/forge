@@ -7,7 +7,12 @@ describe("EventBus", () => {
     const received: string[] = [];
     bus.subscribe((event) => received.push(event.type));
 
-    bus.publish({ type: "task.created", taskId: "task-1", timestamp: new Date() });
+    bus.publish({
+      type: "task.created",
+      taskId: "task-1",
+      goal: "Test goal",
+      timestamp: new Date().toISOString(),
+    });
 
     expect(received).toEqual(["task.created"]);
   });

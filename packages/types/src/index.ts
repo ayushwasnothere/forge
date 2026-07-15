@@ -32,10 +32,34 @@ export interface ToolResult<TData = unknown> {
   metadata: Record<string, unknown>;
 }
 
+export type ToolPermission = "read" | "write" | "execute";
+
+export interface SandboxRunner {
+  execute(
+    command: string[],
+    cwd: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }>;
+}
+
+export interface ToolExecutionContext {
+  repositoryPath: string;
+  allowedPermissions?: readonly ToolPermission[];
+  commandTimeoutMs?: number;
+  signal?: AbortSignal;
+  taskId?: string;
+  /** Approximate remaining token budget — tools should trim output when low. */
+  tokenBudget?: number;
+  sandbox?: SandboxRunner;
+  onApproveCommand?: (command: string) => Promise<boolean>;
+}
+
 export interface Tool<TInput = unknown, TData = unknown> {
   readonly name: string;
   readonly description: string;
-  execute(input: TInput): Promise<ToolResult<TData>>;
+  readonly permission: ToolPermission;
+  execute(input: TInput, context: ToolExecutionContext): Promise<ToolResult<TData>>;
 }
 
 export interface ModelResponse {
@@ -46,6 +70,29 @@ export interface ModelResponse {
     inputTokens: number;
     outputTokens: number;
   };
+}
+
+export interface ModelMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  toolCallId?: string;
+  toolCalls?: readonly ModelToolCall[];
+}
+
+export interface ModelToolDefinition {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+export interface ModelRequest {
+  messages: readonly ModelMessage[];
+  tools: readonly ModelToolDefinition[];
+  signal?: AbortSignal;
+}
+
+export interface ModelProvider {
+  complete(request: ModelRequest): Promise<ModelResponse>;
 }
 
 export interface ModelToolCall {

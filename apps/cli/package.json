@@ -11,7 +11,12 @@
     "start": "bun src/index.ts"
   },
   "dependencies": {
+    "@forge/agent": "workspace:*",
+    "@forge/context": "workspace:*",
+    "@forge/models": "workspace:*",
     "@forge/runtime": "workspace:*",
+    "@forge/session": "workspace:*",
+    "@forge/tools": "workspace:*",
     "commander": "^13.0.0",
     "pino": "^9.6.0",
     "zod": "^3.24.0"

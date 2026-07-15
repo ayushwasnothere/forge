@@ -1,13 +1,25 @@
 export type ForgeEvent =
-  | { type: "task.created"; taskId: string; timestamp: Date }
-  | { type: "task.completed"; taskId: string; timestamp: Date }
-  | { type: "task.failed"; taskId: string; error: string; timestamp: Date }
-  | { type: "tool.started"; toolName: string; timestamp: Date }
+  | { type: "task.created"; taskId: string; goal: string; timestamp: string }
+  | { type: "task.completed"; taskId: string; result: string; timestamp: string }
+  | { type: "task.failed"; taskId: string; error: string; timestamp: string }
+  | { type: "plan.started"; taskId: string; timestamp: string }
+  | { type: "plan.finished"; taskId: string; plan: string; timestamp: string }
+  | { type: "model.started"; taskId: string; step: number; timestamp: string }
+  | {
+      type: "model.finished";
+      taskId: string;
+      step: number;
+      toolCallCount: number;
+      timestamp: string;
+    }
+  | { type: "tool.started"; taskId: string; step: number; toolName: string; timestamp: string }
   | {
       type: "tool.finished";
+      taskId: string;
+      step: number;
       toolName: string;
       success: boolean;
-      timestamp: Date;
+      timestamp: string;
     };
 
 export type EventListener = (event: ForgeEvent) => void;

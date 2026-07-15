@@ -1,0 +1,13 @@
+{
+  "name": "@forge/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@forge/runtime": "workspace:*",
+    "@forge/tools": "workspace:*",
+    "@forge/types": "workspace:*",
+    "zod": "^4.4.3"
+  }
+}

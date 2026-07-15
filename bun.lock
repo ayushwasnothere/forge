@@ -22,15 +22,40 @@
         "forge": "./src/index.ts",
       },
       "dependencies": {
+        "@forge/agent": "workspace:*",
+        "@forge/context": "workspace:*",
+        "@forge/models": "workspace:*",
         "@forge/runtime": "workspace:*",
+        "@forge/session": "workspace:*",
+        "@forge/tools": "workspace:*",
         "commander": "^13.0.0",
         "pino": "^9.6.0",
         "zod": "^3.24.0",
       },
     },
+    "packages/agent": {
+      "name": "@forge/agent",
+      "version": "0.1.0",
+      "dependencies": {
+        "@forge/tools": "workspace:*",
+        "@forge/types": "workspace:*",
+        "zod": "^4.4.3",
+      },
+    },
+    "packages/context": {
+      "name": "@forge/context",
+      "version": "0.1.0",
+    },
     "packages/events": {
       "name": "@forge/events",
       "version": "0.1.0",
+    },
+    "packages/models": {
+      "name": "@forge/models",
+      "version": "0.1.0",
+      "dependencies": {
+        "@forge/types": "workspace:*",
+      },
     },
     "packages/runtime": {
       "name": "@forge/runtime",
@@ -38,6 +63,18 @@
       "dependencies": {
         "@forge/events": "workspace:*",
         "@forge/types": "workspace:*",
+      },
+    },
+    "packages/session": {
+      "name": "@forge/session",
+      "version": "0.1.0",
+    },
+    "packages/tools": {
+      "name": "@forge/tools",
+      "version": "0.1.0",
+      "dependencies": {
+        "@forge/types": "workspace:*",
+        "zod": "^4.4.3",
       },
     },
     "packages/types": {
@@ -116,11 +153,21 @@
 
     "@esbuild/win32-x64": ["@esbuild/win32-x64@0.28.1", "", { "os": "win32", "cpu": "x64" }, "sha512-bm4Mowrv+GXMlpWX++EcXw/iLyd1o3+bJkC2DkWXYVvgZCqD/bSj9ctZeAMC3cIxgjRVR2Dufaiu4YPxr5gW1A=="],
 
+    "@forge/agent": ["@forge/agent@workspace:packages/agent"],
+
     "@forge/cli": ["@forge/cli@workspace:apps/cli"],
+
+    "@forge/context": ["@forge/context@workspace:packages/context"],
 
     "@forge/events": ["@forge/events@workspace:packages/events"],
 
+    "@forge/models": ["@forge/models@workspace:packages/models"],
+
     "@forge/runtime": ["@forge/runtime@workspace:packages/runtime"],
+
+    "@forge/session": ["@forge/session@workspace:packages/session"],
+
+    "@forge/tools": ["@forge/tools@workspace:packages/tools"],
 
     "@forge/types": ["@forge/types@workspace:packages/types"],
 
