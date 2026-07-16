@@ -132,6 +132,21 @@ function printVisualDiff(filename: string, newContent: string, oldContent?: stri
   }
 }
 
+function clearStreamedText(streamedText: string): void {
+  if (!streamedText) return;
+  const columns = process.stdout.columns || 80;
+  const lines = streamedText.split("\n");
+  let lineCount = 0;
+  for (const line of lines) {
+    lineCount += Math.max(1, Math.ceil(line.length / columns));
+  }
+  const moveUp = lineCount - 1;
+  if (moveUp > 0) {
+    process.stdout.write(`\x1b[${moveUp}A`);
+  }
+  process.stdout.write("\r\x1b[J");
+}
+
 program
   .name("forge")
   .description("A modular, terminal-first AI coding-agent runtime")
@@ -376,6 +391,7 @@ program
         });
 
         let stepHadContent = false;
+        let agentStreamedText = "";
         const answer = await agent.run(
           agentTask,
           {
@@ -391,6 +407,7 @@ program
             maxSteps: Number(options.maxSteps),
             repositoryContext,
             history,
+            enablePlanning: true,
             onEvent: (event) => {
               const now = new Date().toISOString();
               if (event.type === "plan.started") {
@@ -409,6 +426,7 @@ program
               }
               if (event.type === "model.started") {
                 stepHadContent = false;
+                agentStreamedText = "";
                 printThinking(event.step);
                 runtime.events.publish({
                   type: "model.started",
@@ -419,10 +437,14 @@ program
               }
               if (event.type === "model.token") {
                 stepHadContent = true;
+                agentStreamedText += event.token;
                 process.stdout.write(event.token);
               }
               if (event.type === "model.finished") {
-                if (stepHadContent) process.stdout.write("\n");
+                if (stepHadContent) {
+                  clearStreamedText(agentStreamedText);
+                  console.log(renderMarkdown(agentStreamedText));
+                }
                 runtime.events.publish({
                   type: "model.finished",
                   taskId,
@@ -829,6 +851,7 @@ program
             isAgentRunning = true;
             activeController = new AbortController();
             let chatStepHadContent = false;
+            let chatStreamedText = "";
 
             try {
               const answer = await agent.run(
@@ -846,6 +869,7 @@ program
                   maxSteps: Number(options.maxSteps),
                   repositoryContext,
                   history: agent.messages,
+                  enablePlanning: true,
                   onEvent: (event) => {
                     const now = new Date().toISOString();
                     if (event.type === "plan.started") {
@@ -864,6 +888,7 @@ program
                     }
                     if (event.type === "model.started") {
                       chatStepHadContent = false;
+                      chatStreamedText = "";
                       printThinking(event.step);
                       runtime.events.publish({
                         type: "model.started",
@@ -874,10 +899,14 @@ program
                     }
                     if (event.type === "model.token") {
                       chatStepHadContent = true;
+                      chatStreamedText += event.token;
                       process.stdout.write(event.token);
                     }
                     if (event.type === "model.finished") {
-                      if (chatStepHadContent) process.stdout.write("\n");
+                      if (chatStepHadContent) {
+                        clearStreamedText(chatStreamedText);
+                        console.log(renderMarkdown(chatStreamedText));
+                      }
                       runtime.events.publish({
                         type: "model.finished",
                         taskId,

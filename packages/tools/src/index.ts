@@ -1232,7 +1232,15 @@ async function runProcess(
 
 function shellCommand(command: string): string[] {
   return process.platform === "win32"
-    ? ["cmd.exe", "/d", "/s", "/c", command]
+    ? [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        command,
+      ]
     : ["sh", "-lc", command];
 }
 

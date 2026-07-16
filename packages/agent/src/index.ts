@@ -18,6 +18,7 @@ export interface AgentRunOptions {
   verifyCommand?: string;
   history?: ModelMessage[];
   onEvent?: (event: AgentEvent) => void;
+  enablePlanning?: boolean;
 }
 
 /** Approximate token count — 1 token ≈ 4 chars. */
@@ -216,16 +217,44 @@ export class CodingAgent {
         content: `Continuing the task. Additional instructions: ${task}`,
       });
     } else {
-      // Fresh start — emit plan events but bake the plan into system context
+      // Fresh start — generate a real plan using the model if requested
       options.onEvent?.({ type: "plan.started" });
-      const planNote = `Task: ${task}\n\nRepository context:\n${options.repositoryContext ?? "(not provided)"}`;
-      options.onEvent?.({ type: "plan.finished", plan: planNote });
+
+      let generatedPlan = `Task: ${task}\n\nRepository context:\n${options.repositoryContext ?? "(not provided)"}`;
+
+      if (options.enablePlanning) {
+        try {
+          const plannerResponse = await this.model.complete({
+            messages: [
+              {
+                role: "system",
+                content:
+                  "You are Forge's planning assistant. Generate a concise, step-by-step implementation plan for the given task. List what files to create or modify, any command executions needed, and how to verify the work. Keep it clear and action-oriented. Never output tool calls here, output only raw text.",
+              },
+              {
+                role: "user",
+                content: `Task: ${task}\n\nRepository context:\n${options.repositoryContext ?? "(not provided)"}`,
+              },
+            ],
+            tools: [],
+          });
+          if (plannerResponse.content) {
+            generatedPlan = plannerResponse.content;
+          }
+        } catch (error) {
+          // Fallback to basic planNote if planning fails
+        }
+      }
+
+      options.onEvent?.({ type: "plan.finished", plan: generatedPlan });
+
+      const planNote = `Task: ${task}\n\nImplementation Plan:\n${generatedPlan}\n\nRepository Context:\n${options.repositoryContext ?? "(not provided)"}`;
 
       messages.push(
         { role: "system", content: SYSTEM_PROMPT },
         {
           role: "user",
-          content: `${planNote}\n\nPlease begin. Start by orienting yourself in the repository.`,
+          content: `${planNote}\n\nPlease begin executing the plan.`,
         },
       );
     }
