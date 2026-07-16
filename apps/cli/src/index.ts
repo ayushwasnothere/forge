@@ -30,6 +30,108 @@ import { printHeader, printThinking, printToolEnd, printToolStart, renderMarkdow
 
 const program = new Command();
 
+async function loadExternalTools(registry: ToolRegistry, root: string): Promise<void> {
+  const { readFile } = await import("node:fs/promises");
+  const { join, resolve } = await import("node:path");
+
+  const configPath = join(root, "forge.config.json");
+  const content = await readFile(configPath, "utf8").catch(() => null);
+  if (!content) return;
+
+  try {
+    const config = JSON.parse(content) as { tools?: string[] };
+    if (Array.isArray(config.tools)) {
+      for (const toolRelPath of config.tools) {
+        const absPath = resolve(root, toolRelPath);
+        const mod = await import(absPath);
+        const toolObj = mod.default || mod.tool;
+        if (toolObj && typeof toolObj.name === "string" && typeof toolObj.execute === "function") {
+          registry.register(toolObj);
+          console.log(`🔌 Registered custom tool: ${toolObj.name} from ${toolRelPath}`);
+        } else {
+          console.warn(`⚠️ Custom tool module at ${toolRelPath} must export a valid Tool object.`);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `⚠️ Failed to parse or load forge.config.json: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+function printVisualDiff(filename: string, newContent: string, oldContent?: string): void {
+  // Styles
+  const reset = "\x1b[0m";
+  const bold = "\x1b[1m";
+  const cyan = "\x1b[36m";
+  const red = "\x1b[31m";
+  const green = "\x1b[32m";
+  const dim = "\x1b[2m";
+
+  console.log(`\n📄 ${bold}${cyan}Proposed changes to ${filename}:${reset}`);
+  if (oldContent === undefined) {
+    console.log(`${green}+ (New File: ${Buffer.byteLength(newContent)} bytes)${reset}`);
+    return;
+  }
+
+  const oldLines = oldContent.split("\n");
+  const newLines = newContent.split("\n");
+
+  let i = 0;
+  let j = 0;
+  let printedLines = 0;
+
+  while (i < oldLines.length || j < newLines.length) {
+    if (printedLines > 25) {
+      console.log(`${dim}... (remaining changes omitted for brevity)${reset}`);
+      break;
+    }
+
+    if (oldLines[i] === newLines[j]) {
+      i++;
+      j++;
+    } else {
+      // Look ahead to find matching lines
+      let matchIdx = -1;
+      for (let k = j; k < newLines.length; k++) {
+        if (newLines[k] === oldLines[i]) {
+          matchIdx = k;
+          break;
+        }
+      }
+
+      if (matchIdx !== -1) {
+        // Elements from j to matchIdx were added
+        for (let k = j; k < matchIdx; k++) {
+          if (printedLines <= 25) {
+            // biome-ignore lint/style/noNonNullAssertion: bounds checked
+            console.log(`${green}+ ${newLines[k]!}${reset}`);
+            printedLines++;
+          }
+        }
+        j = matchIdx;
+      } else {
+        // Element at i was removed/modified
+        if (oldLines[i] !== undefined) {
+          if (printedLines <= 25) {
+            console.log(`${red}- ${oldLines[i]}${reset}`);
+            printedLines++;
+          }
+        }
+        if (newLines[j] !== undefined) {
+          if (printedLines <= 25) {
+            console.log(`${green}+ ${newLines[j]}${reset}`);
+            printedLines++;
+          }
+        }
+        i++;
+        j++;
+      }
+    }
+  }
+}
+
 program
   .name("forge")
   .description("A modular, terminal-first AI coding-agent runtime")
@@ -165,6 +267,7 @@ program
       for (const tool of tools) {
         registry.register(tool);
       }
+      await loadExternalTools(registry, process.cwd());
       const agent = new CodingAgent(
         createProvider({
           provider,
@@ -231,6 +334,25 @@ program
             });
           };
 
+      const onApproveFileChange = options.allowWrite
+        ? undefined
+        : async (path: string, newContent: string, currentContent?: string) => {
+            if (!process.stdin.isTTY) {
+              return false;
+            }
+            printVisualDiff(path, newContent, currentContent);
+            const rl = readline.createInterface({
+              input: process.stdin,
+              output: process.stdout,
+            });
+            return new Promise<boolean>((resolve) => {
+              rl.question(`⚠️  Allow file changes to "${path}"? (y/N): `, (answer) => {
+                rl.close();
+                resolve(answer.trim().toLowerCase() === "y");
+              });
+            });
+          };
+
       const controller = new AbortController();
       const cancel = () => {
         console.log("\nCancelling agent…");
@@ -253,6 +375,7 @@ program
           timestamp: new Date().toISOString(),
         });
 
+        let stepHadContent = false;
         const answer = await agent.run(
           agentTask,
           {
@@ -262,6 +385,7 @@ program
             signal: controller.signal,
             taskId,
             ...(onApproveCommand ? { onApproveCommand } : {}),
+            ...(onApproveFileChange ? { onApproveFileChange } : {}),
           },
           {
             maxSteps: Number(options.maxSteps),
@@ -284,6 +408,7 @@ program
                 });
               }
               if (event.type === "model.started") {
+                stepHadContent = false;
                 printThinking(event.step);
                 runtime.events.publish({
                   type: "model.started",
@@ -292,7 +417,12 @@ program
                   timestamp: now,
                 });
               }
+              if (event.type === "model.token") {
+                stepHadContent = true;
+                process.stdout.write(event.token);
+              }
               if (event.type === "model.finished") {
+                if (stepHadContent) process.stdout.write("\n");
                 runtime.events.publish({
                   type: "model.finished",
                   taskId,
@@ -343,18 +473,31 @@ program
           messages: agent.messages,
         });
 
-        printHeader("Answer");
-        console.log(renderMarkdown(answer));
+        // Content was already streamed live; show only the metadata footer
+        printHeader("Summary");
+        const metaLines: string[] = [];
+        const filesMatch = answer.match(
+          /\*\*Files modified:\*\*\n([\s\S]*?)(?=\n\n|\n\*\*Tokens|$)/,
+        );
+        if (filesMatch) metaLines.push(filesMatch[0]);
+        const tokensMatch = answer.match(/\*\*Tokens used:\*\*.+/);
+        if (tokensMatch) metaLines.push(tokensMatch[0]);
+        if (metaLines.length > 0) console.log(renderMarkdown(metaLines.join("\n")));
+        else console.log("Done.");
         console.log(`\nSession saved: .forge/sessions/${sessionId}.json`);
       } catch (error) {
-        const errorMsg = error instanceof Error ? error.message : String(error);
-        runtime.events.publish({
-          type: "task.failed",
-          taskId,
-          error: errorMsg,
-          timestamp: new Date().toISOString(),
-        });
-        throw error;
+        if (error instanceof DOMException && error.name === "AbortError") {
+          console.log("\n🛑 Agent run cancelled.");
+        } else {
+          const errorMsg = error instanceof Error ? error.message : String(error);
+          runtime.events.publish({
+            type: "task.failed",
+            taskId,
+            error: errorMsg,
+            timestamp: new Date().toISOString(),
+          });
+          throw error;
+        }
       } finally {
         process.removeListener("SIGINT", cancel);
       }
@@ -382,11 +525,11 @@ program
       verbose?: boolean;
     }) => {
       const apiKey = process.env.FORGE_API_KEY;
-      const model = process.env.FORGE_MODEL;
-      const provider = (options.provider ??
+      let currentModel = process.env.FORGE_MODEL ?? "";
+      let currentProvider = (options.provider ??
         process.env.FORGE_PROVIDER ??
         "openrouter") as ProviderKind;
-      if (!model) throw new Error("Set FORGE_MODEL before using the agent command.");
+      if (!currentModel) throw new Error("Set FORGE_MODEL before using the agent command.");
       const registry = new ToolRegistry();
       const tools = [
         readFileTool,
@@ -407,11 +550,12 @@ program
       for (const tool of tools) {
         registry.register(tool);
       }
-      const agent = new CodingAgent(
+      await loadExternalTools(registry, process.cwd());
+      let agent = new CodingAgent(
         createProvider({
-          provider,
+          provider: currentProvider,
           ...(apiKey ? { apiKey } : {}),
-          model,
+          model: currentModel,
           ...(process.env.FORGE_BASE_URL ? { baseUrl: process.env.FORGE_BASE_URL } : {}),
         }),
         registry,
@@ -422,7 +566,7 @@ program
       ].filter((value): value is "write" | "execute" => value !== undefined);
 
       const store = new SessionStore(process.cwd());
-      const sessionId = options.session ?? crypto.randomUUID();
+      let sessionId = options.session ?? crypto.randomUUID();
       let loadedSession: StoredSession | undefined;
       let plan = "";
 
@@ -468,12 +612,39 @@ program
             });
           };
 
-      const controller = new AbortController();
-      const cancel = () => {
-        console.log("\nCancelling agent…");
-        controller.abort();
+      const onApproveFileChange = options.allowWrite
+        ? undefined
+        : async (path: string, newContent: string, currentContent?: string) => {
+            if (!process.stdin.isTTY) {
+              return false;
+            }
+            printVisualDiff(path, newContent, currentContent);
+            const rlFile = readline.createInterface({
+              input: process.stdin,
+              output: process.stdout,
+            });
+            return new Promise<boolean>((resolve) => {
+              rlFile.question(`⚠️  Allow file changes to "${path}"? (y/N): `, (answer) => {
+                rlFile.close();
+                resolve(answer.trim().toLowerCase() === "y");
+              });
+            });
+          };
+
+      let activeController: AbortController | undefined;
+      let isAgentRunning = false;
+
+      const sigintHandler = () => {
+        if (isAgentRunning && activeController) {
+          console.log("\n🛑 Cancelling agent run...");
+          activeController.abort();
+          activeController = undefined;
+        } else {
+          console.log("\nGoodbye!");
+          process.exit(0);
+        }
       };
-      process.once("SIGINT", cancel);
+      process.on("SIGINT", sigintHandler);
 
       try {
         const ctxResult = await new RepositoryContextBuilder().buildStructured(process.cwd());
@@ -508,6 +679,10 @@ program
               console.log(
                 "Available REPL commands:\n" +
                   "  /exit, /quit - Exit the chat session\n" +
+                  "  /new         - Start a new clean session\n" +
+                  "  /resume [id] - List or load a saved session\n" +
+                  "  /provider [p] [m] - Show, switch, or configure model provider\n" +
+                  "  /model [name] - Show or change the active LLM model\n" +
                   "  /history     - Print active messages in current chat\n" +
                   "  /diff        - View unstaged repository changes\n" +
                   "  /reset       - Clear active chat history",
@@ -515,8 +690,115 @@ program
               promptUser();
               return;
             }
+            if (input.startsWith("/provider")) {
+              const parts = input.split(" ");
+              const nextProvider = parts[1]?.trim() as ProviderKind | undefined;
+              const nextModel = parts[2]?.trim();
+
+              if (!nextProvider) {
+                console.log(`Current provider: "${currentProvider}" (Model: "${currentModel}")`);
+                console.log("Use: /provider <openrouter|openai|grok|anthropic|ollama> [modelName]");
+              } else {
+                currentProvider = nextProvider;
+                if (nextModel) currentModel = nextModel;
+
+                // Re-instantiate agent with new provider
+                const oldMessages = agent.messages;
+                agent = new CodingAgent(
+                  createProvider({
+                    provider: currentProvider,
+                    model: currentModel,
+                    ...(currentProvider !== "ollama" && apiKey ? { apiKey } : {}),
+                    ...(process.env.FORGE_BASE_URL ? { baseUrl: process.env.FORGE_BASE_URL } : {}),
+                  }),
+                  registry,
+                );
+                agent.messages = oldMessages;
+                console.log(`🔌 Switched provider to ${currentProvider} (Model: ${currentModel})`);
+              }
+              promptUser();
+              return;
+            }
+            if (input.startsWith("/model")) {
+              const parts = input.split(" ");
+              const nextModel = parts[1]?.trim();
+
+              if (!nextModel) {
+                console.log(`Current model: "${currentModel}"`);
+                console.log("Use: /model <modelName>");
+              } else {
+                currentModel = nextModel;
+
+                // Re-instantiate agent with new model
+                const oldMessages = agent.messages;
+                agent = new CodingAgent(
+                  createProvider({
+                    provider: currentProvider,
+                    model: currentModel,
+                    ...(currentProvider !== "ollama" && apiKey ? { apiKey } : {}),
+                    ...(process.env.FORGE_BASE_URL ? { baseUrl: process.env.FORGE_BASE_URL } : {}),
+                  }),
+                  registry,
+                );
+                agent.messages = oldMessages;
+                console.log(`🧠 Switched model to ${currentModel}`);
+              }
+              promptUser();
+              return;
+            }
+            if (input === "/new") {
+              agent.messages = [];
+              plan = "";
+              sessionId = crypto.randomUUID();
+              loadedSession = undefined;
+              console.log(`✨ New session started (ID: ${sessionId}).`);
+              promptUser();
+              return;
+            }
+            if (input.startsWith("/resume")) {
+              const parts = input.split(" ");
+              const targetId = parts[1]?.trim();
+              if (targetId) {
+                try {
+                  const resumedSession = await store.load(targetId);
+                  agent.messages = resumedSession.messages ?? [];
+                  plan = resumedSession.plan;
+                  console.log(`🌿 Resumed session ${targetId}`);
+                } catch {
+                  console.log(`⚠️ Saved session "${targetId}" not found.`);
+                }
+              } else {
+                const sessions = await store.list();
+                if (sessions.length === 0) {
+                  console.log("No saved sessions.");
+                } else {
+                  console.log("Saved sessions (use '/resume <id>'):");
+                  for (const s of sessions) {
+                    console.log(`  ${s.id} - ${s.updatedAt} - ${s.task}`);
+                  }
+                }
+              }
+              promptUser();
+              return;
+            }
             if (input === "/history") {
-              console.log(JSON.stringify(agent.messages, null, 2));
+              if (agent.messages.length === 0) {
+                console.log("(no messages in current session)");
+              } else {
+                console.log(`\n📜 Session history (${agent.messages.length} messages):`);
+                for (const [idx, msg] of agent.messages.entries()) {
+                  const role = msg.role.padEnd(10);
+                  const preview =
+                    typeof msg.content === "string"
+                      ? msg.content.slice(0, 120).replace(/\n/g, " ")
+                      : msg.toolCalls
+                        ? `[${msg.toolCalls.map((c) => c.name).join(", ")}]`
+                        : "(empty)";
+                  console.log(
+                    `  ${String(idx + 1).padStart(3)}. [${role}] ${preview}${(msg.content?.length ?? 0) > 120 ? "…" : ""}`,
+                  );
+                }
+              }
               promptUser();
               return;
             }
@@ -544,6 +826,10 @@ program
               timestamp: new Date().toISOString(),
             });
 
+            isAgentRunning = true;
+            activeController = new AbortController();
+            let chatStepHadContent = false;
+
             try {
               const answer = await agent.run(
                 input,
@@ -551,9 +837,10 @@ program
                   repositoryPath: process.cwd(),
                   allowedPermissions: permissions,
                   commandTimeoutMs: Number(options.commandTimeout) * 1000,
-                  signal: controller.signal,
+                  signal: activeController.signal,
                   taskId,
                   ...(onApproveCommand ? { onApproveCommand } : {}),
+                  ...(onApproveFileChange ? { onApproveFileChange } : {}),
                 },
                 {
                   maxSteps: Number(options.maxSteps),
@@ -576,6 +863,7 @@ program
                       });
                     }
                     if (event.type === "model.started") {
+                      chatStepHadContent = false;
                       printThinking(event.step);
                       runtime.events.publish({
                         type: "model.started",
@@ -584,7 +872,12 @@ program
                         timestamp: now,
                       });
                     }
+                    if (event.type === "model.token") {
+                      chatStepHadContent = true;
+                      process.stdout.write(event.token);
+                    }
                     if (event.type === "model.finished") {
+                      if (chatStepHadContent) process.stdout.write("\n");
                       runtime.events.publish({
                         type: "model.finished",
                         taskId,
@@ -635,17 +928,35 @@ program
                 messages: agent.messages,
               });
 
-              printHeader("Answer");
-              console.log(renderMarkdown(answer));
+              // Content was already streamed live; show only metadata
+              const chatMetaLines: string[] = [];
+              const chatFilesMatch = answer.match(
+                /\*\*Files modified:\*\*\n([\s\S]*?)(?=\n\n|\n\*\*Tokens|$)/,
+              );
+              if (chatFilesMatch) chatMetaLines.push(chatFilesMatch[0]);
+              const chatTokensMatch = answer.match(/\*\*Tokens used:\*\*.+/);
+              if (chatTokensMatch) chatMetaLines.push(chatTokensMatch[0]);
+              if (chatMetaLines.length > 0) {
+                printHeader("Summary");
+                console.log(renderMarkdown(chatMetaLines.join("\n")));
+              }
             } catch (error) {
-              const errorMsg = error instanceof Error ? error.message : String(error);
-              console.error(`⚠️ Error running task: ${errorMsg}`);
-              runtime.events.publish({
-                type: "task.failed",
-                taskId,
-                error: errorMsg,
-                timestamp: new Date().toISOString(),
-              });
+              // Suppress AbortError from Ctrl+C cancellation
+              if (error instanceof DOMException && error.name === "AbortError") {
+                console.log("\n🛑 Agent run cancelled.");
+              } else {
+                const errorMsg = error instanceof Error ? error.message : String(error);
+                console.error(`⚠️ Error running task: ${errorMsg}`);
+                runtime.events.publish({
+                  type: "task.failed",
+                  taskId,
+                  error: errorMsg,
+                  timestamp: new Date().toISOString(),
+                });
+              }
+            } finally {
+              isAgentRunning = false;
+              activeController = undefined;
             }
             promptUser();
           });
@@ -658,7 +969,7 @@ program
           rl.on("close", resolve);
         });
       } finally {
-        process.removeListener("SIGINT", cancel);
+        process.off("SIGINT", sigintHandler);
       }
     },
   );

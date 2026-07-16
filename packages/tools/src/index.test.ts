@@ -232,6 +232,34 @@ describe("ToolRegistry", () => {
     expect(symbols.some((s) => s.name === "CONSTANT" && s.kind === "variable")).toBe(true);
   });
 
+  it("list_symbols AST ignores comments and string variable contents", async () => {
+    const repositoryPath = await createRepository();
+    const code = [
+      "// export class CommentedClass {}",
+      "/* export interface CommentedInterface {} */",
+      "export const myString = 'export class StringClass {}';",
+    ].join("\n");
+    await writeFile(join(repositoryPath, "src/ignore.ts"), code);
+
+    const registry = new ToolRegistry();
+    registry.register(listSymbolsTool);
+
+    const result = await registry.execute(
+      "list_symbols",
+      { path: "src/ignore.ts" },
+      { repositoryPath },
+    );
+    expect(result.success).toBe(true);
+    const symbols = (result.data as { symbols: Array<{ name: string; kind: string }> }).symbols;
+    // Commented out declarations should be ignored
+    expect(symbols.some((s) => s.name === "CommentedClass")).toBe(false);
+    expect(symbols.some((s) => s.name === "CommentedInterface")).toBe(false);
+    // Declarations inside strings should be ignored
+    expect(symbols.some((s) => s.name === "StringClass")).toBe(false);
+    // The variable itself should be captured
+    expect(symbols.some((s) => s.name === "myString" && s.kind === "variable")).toBe(true);
+  });
+
   it("handles run_command permissions and onApproveCommand callback", async () => {
     const repositoryPath = await createRepository();
     const registry = new ToolRegistry();

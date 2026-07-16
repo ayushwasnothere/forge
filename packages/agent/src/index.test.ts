@@ -9,7 +9,7 @@ import type {
 } from "@forge/types";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { CodingAgent } from "./index";
+import { CodingAgent, pruneHistory } from "./index";
 
 class ScriptedProvider implements ModelProvider {
   private calls = 0;
@@ -256,5 +256,95 @@ describe("CodingAgent", () => {
 
     expect(result).toContain("1,000");
     expect(result).toContain("200");
+  });
+
+  describe("pruneHistory", () => {
+    it("keeps first and last messages intact", () => {
+      const messages: ModelMessage[] = [
+        { role: "system", content: "system text" },
+        {
+          role: "tool",
+          toolCallId: "t-1",
+          content: `✅ run_command:\n\`\`\`\n${"A".repeat(300)}\n\`\`\``,
+        },
+        { role: "user", content: "user text" },
+      ];
+      // Note: we need enough assistant messages for run_command truncation to trigger, but
+      // here the tool message is the second message, and the last is kept intact.
+      const pruned = pruneHistory(messages);
+      expect(pruned[0]?.content).toBe("system text");
+      expect(pruned[2]?.content).toBe("user text");
+    });
+
+    it("replaces older read_file contents when same arguments are used", () => {
+      const messages: ModelMessage[] = [
+        { role: "system", content: "sys" },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "read-1", name: "read_file", arguments: { path: "a.txt" } }],
+        },
+        {
+          role: "tool",
+          toolCallId: "read-1",
+          content: "old content here",
+        },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "read-2", name: "read_file", arguments: { path: "a.txt" } }],
+        },
+        {
+          role: "tool",
+          toolCallId: "read-2",
+          content: "new content here",
+        },
+        { role: "user", content: "done" },
+      ];
+
+      const pruned = pruneHistory(messages);
+      expect(pruned[2]?.content).toBe(
+        "[File contents replaced to save context space. Refer to latest read.]",
+      );
+      expect(pruned[4]?.content).toBe("new content here");
+    });
+
+    it("truncates successful run_command outputs older than 3 steps back", () => {
+      const messages: ModelMessage[] = [
+        { role: "system", content: "sys" },
+        // Step 1: older
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: "cmd-1", name: "run_command", arguments: { command: "test" } }],
+        },
+        {
+          role: "tool",
+          toolCallId: "cmd-1",
+          content: `✅ run_command:\n\`\`\`\n${"A".repeat(300)}\n\`\`\``,
+        },
+        // Step 2
+        {
+          role: "assistant",
+          content: "step 2",
+        },
+        // Step 3
+        {
+          role: "assistant",
+          content: "step 3",
+        },
+        // Step 4 (latest/current step)
+        {
+          role: "assistant",
+          content: "step 4",
+        },
+        { role: "user", content: "done" },
+      ];
+
+      const pruned = pruneHistory(messages);
+      expect(pruned[2]?.content).toContain("... [output truncated for brevity]");
+      expect(pruned[2]?.content).toContain("A".repeat(200));
+      expect(pruned[2]?.content?.length).toBeLessThan(300);
+    });
   });
 });

@@ -6,6 +6,7 @@
   "exports": "./src/index.ts",
   "dependencies": {
     "@forge/types": "workspace:*",
+    "typescript": "^5.7.3",
     "zod": "^4.4.3"
   }
 }

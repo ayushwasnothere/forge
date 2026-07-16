@@ -53,6 +53,11 @@ export interface ToolExecutionContext {
   tokenBudget?: number;
   sandbox?: SandboxRunner;
   onApproveCommand?: (command: string) => Promise<boolean>;
+  onApproveFileChange?: (
+    path: string,
+    newContent: string,
+    currentContent?: string,
+  ) => Promise<boolean>;
 }
 
 export interface Tool<TInput = unknown, TData = unknown> {
@@ -89,6 +94,7 @@ export interface ModelRequest {
   messages: readonly ModelMessage[];
   tools: readonly ModelToolDefinition[];
   signal?: AbortSignal;
+  onToken?: (token: string) => void;
 }
 
 export interface ModelProvider {

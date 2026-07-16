@@ -3,6 +3,7 @@ import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import type { Tool, ToolExecutionContext, ToolResult } from "@forge/types";
+import ts from "typescript";
 import { z } from "zod";
 
 if (typeof Bun === "undefined") {
@@ -433,45 +434,63 @@ export interface SymbolEntry {
 }
 
 function extractSymbols(content: string, ext: string): SymbolEntry[] {
-  const lines = content.split("\n");
   const symbols: SymbolEntry[] = [];
 
-  const patterns: Array<{ rx: RegExp; kind: SymbolEntry["kind"] }> = [];
-
-  // JS / TS / TSX / JSX
+  // JS / TS / TSX / JSX - AST compiler API parser
   if ([".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs"].includes(ext)) {
-    patterns.push(
-      {
-        rx: /^(?:export\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][A-Za-z0-9_$]*)/,
-        kind: "function",
-      },
-      {
-        rx: /^(?:export\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$<,>\s]*?)(?:\s+extends|\s+implements|\s*\{)/,
-        kind: "class",
-      },
-      {
-        rx: /^(?:export\s+)?interface\s+([A-Za-z_$][A-Za-z0-9_$<,>\s]*?)(?:\s+extends|\s*\{)/,
-        kind: "interface",
-      },
-      { rx: /^(?:export\s+)?type\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:<|=)/, kind: "type" },
-      {
-        rx: /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?::|=)/,
-        kind: "variable",
-      },
-      { rx: /^export\s+\{\s*([A-Za-z_$][A-Za-z0-9_$,\s]*)\}/, kind: "export" },
-    );
+    try {
+      const sourceFile = ts.createSourceFile(`file${ext}`, content, ts.ScriptTarget.Latest, true);
+
+      function visit(node: ts.Node) {
+        let name = "";
+        let kind: SymbolEntry["kind"] | null = null;
+
+        if (ts.isFunctionDeclaration(node) && node.name) {
+          name = node.name.text;
+          kind = "function";
+        } else if (ts.isClassDeclaration(node) && node.name) {
+          name = node.name.text;
+          kind = "class";
+        } else if (ts.isInterfaceDeclaration(node) && node.name) {
+          name = node.name.text;
+          kind = "interface";
+        } else if (ts.isTypeAliasDeclaration(node) && node.name) {
+          name = node.name.text;
+          kind = "type";
+        } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+          // Verify it's a top-level exported/assigned declaration
+          const varList = node.parent;
+          if (ts.isVariableDeclarationList(varList) && ts.isVariableStatement(varList.parent)) {
+            name = node.name.text;
+            kind = "variable";
+          }
+        }
+
+        if (kind && name) {
+          const { line } = ts.getLineAndCharacterOfPosition(sourceFile, node.getStart(sourceFile));
+          symbols.push({ name, kind, line: line + 1 });
+        }
+
+        ts.forEachChild(node, visit);
+      }
+
+      visit(sourceFile);
+      return symbols.sort((a, b) => a.line - b.line);
+    } catch {
+      // Fall through to regex if AST parser fails
+    }
   }
 
-  // Python
+  // Fallback regex matching (Python, Rust, Go, or failed JS/TS parse)
+  const lines = content.split("\n");
+  const patterns: Array<{ rx: RegExp; kind: SymbolEntry["kind"] }> = [];
+
   if (ext === ".py") {
     patterns.push(
       { rx: /^(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)/, kind: "function" },
       { rx: /^class\s+([A-Za-z_][A-Za-z0-9_]*)/, kind: "class" },
     );
-  }
-
-  // Rust
-  if (ext === ".rs") {
+  } else if (ext === ".rs") {
     patterns.push(
       {
         rx: /^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)/,
@@ -482,10 +501,7 @@ function extractSymbols(content: string, ext: string): SymbolEntry[] {
       { rx: /^(?:pub(?:\([^)]*\))?\s+)?enum\s+([A-Za-z_][A-Za-z0-9_]*)/, kind: "type" },
       { rx: /^(?:pub(?:\([^)]*\))?\s+)?type\s+([A-Za-z_][A-Za-z0-9_]*)/, kind: "type" },
     );
-  }
-
-  // Go
-  if (ext === ".go") {
+  } else if (ext === ".go") {
     patterns.push(
       { rx: /^func\s+(?:\([^)]+\)\s+)?([A-Za-z_][A-Za-z0-9_]*)/, kind: "function" },
       { rx: /^type\s+([A-Za-z_][A-Za-z0-9_]*)\s+struct/, kind: "class" },
@@ -542,7 +558,18 @@ export const replaceTextTool: RegisteredTool<
         );
       }
 
-      await writeFile(absolutePath, content.replace(oldText, newText), "utf8");
+      const newContent = content.replace(oldText, newText);
+      if (context.onApproveFileChange) {
+        const approved = await context.onApproveFileChange(path, newContent, content);
+        if (!approved) {
+          return failure<{ path: string; replacements: 1 }>(
+            "File replacement request was rejected by the user.",
+            startedAt,
+          );
+        }
+      }
+
+      await writeFile(absolutePath, newContent, "utf8");
       return success({ path: absolutePath, replacements: 1 as const }, startedAt);
     } catch (error) {
       return failure<{ path: string; replacements: 1 }>(toMessage(error), startedAt);
@@ -570,6 +597,17 @@ export const writeFileTool: RegisteredTool<
         .catch(() => false);
       if (exists && !overwrite)
         return failure(`${path} already exists; set overwrite to true to replace it.`, startedAt);
+
+      const originalContent = exists
+        ? await readFile(absolutePath, "utf8").catch(() => undefined)
+        : undefined;
+      if (context.onApproveFileChange) {
+        const approved = await context.onApproveFileChange(path, content, originalContent);
+        if (!approved) {
+          return failure("File write request was rejected by the user.", startedAt);
+        }
+      }
+
       // Auto-create parent directories
       await mkdir(dirname(absolutePath), { recursive: true });
       await writeFile(absolutePath, content, "utf8");
@@ -591,7 +629,7 @@ export const applyPatchTool: RegisteredTool<{ patch: string }, ApplyPatchResult>
     if (!hasPermission(context, "write"))
       return failure("Write permission is required to use apply_patch.", startedAt);
     try {
-      const result = await applyUnifiedDiff(patch, context.repositoryPath);
+      const result = await applyUnifiedDiff(patch, context.repositoryPath, context);
       return success(result, startedAt);
     } catch (error) {
       return failure(toMessage(error), startedAt);
@@ -608,6 +646,7 @@ export interface ApplyPatchResult {
 async function applyUnifiedDiff(
   patchText: string,
   repositoryPath: string,
+  context?: ToolExecutionContext,
 ): Promise<ApplyPatchResult> {
   // Parse unified diff format
   const fileBlocks = patchText.split(/^(?=--- )/m).filter((b) => b.trim());
@@ -630,8 +669,8 @@ async function applyUnifiedDiff(
       const rel = relative(resolve(repositoryPath), absolutePath);
       if (rel.startsWith("..")) continue;
 
-      let content = await readFile(absolutePath, "utf8").catch(() => "");
-      const contentLines = content.split("\n");
+      const originalContent = await readFile(absolutePath, "utf8").catch(() => "");
+      const contentLines = originalContent.split("\n");
 
       // Parse and apply hunks
       const hunks = parseHunks(lines);
@@ -646,7 +685,19 @@ async function applyUnifiedDiff(
         }
       }
 
-      content = contentLines.join("\n");
+      const content = contentLines.join("\n");
+      if (context?.onApproveFileChange) {
+        const approved = await context.onApproveFileChange(
+          targetPath,
+          content,
+          originalContent || undefined,
+        );
+        if (!approved) {
+          result.hunksRejected += hunks.length;
+          continue;
+        }
+      }
+
       await mkdir(dirname(absolutePath), { recursive: true });
       await writeFile(absolutePath, content, "utf8");
       result.filesPatched.push(rel.replace(/\\/g, "/"));
