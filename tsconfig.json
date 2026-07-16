@@ -15,7 +15,8 @@
     "paths": {
       "@forge/types": ["packages/types/src/index.ts"],
       "@forge/events": ["packages/events/src/index.ts"],
-      "@forge/runtime": ["packages/runtime/src/index.ts"]
+      "@forge/runtime": ["packages/runtime/src/index.ts"],
+      "@forge/memory": ["packages/memory/src/index.ts"]
     }
   },
   "include": ["apps/**/*.ts", "packages/**/*.ts", "vitest.config.ts"]

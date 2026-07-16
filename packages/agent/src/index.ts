@@ -1,3 +1,4 @@
+import { MemoryStore } from "@forge/memory";
 import { detectTestCommand } from "@forge/runtime";
 import type { ToolRegistry } from "@forge/tools";
 import { formatToolResult } from "@forge/tools";
@@ -9,7 +10,7 @@ export type AgentEvent =
   | { type: "model.started"; step: number }
   | { type: "model.token"; step: number; token: string }
   | { type: "model.finished"; step: number; toolCallCount: number }
-  | { type: "tool.started"; step: number; toolName: string }
+  | { type: "tool.started"; step: number; toolName: string; args: Record<string, unknown> }
   | { type: "tool.finished"; step: number; toolName: string; success: boolean };
 
 export interface AgentRunOptions {
@@ -33,22 +34,30 @@ function compressHistory(messages: ModelMessage[], keepSystemUser: number): Mode
   const header = messages.slice(0, keepSystemUser);
   const tail = messages.slice(keepSystemUser);
 
-  // Find oldest complete assistant→tool pair to compress
+  // Find oldest complete assistant→tool pairs to compress.
+  // We must only cut at boundaries where an assistant message (with tool calls)
+  // is immediately followed by its tool results, to preserve conversation validity.
   let compressUpTo = 0;
   let pairs = 0;
   for (let i = 0; i < tail.length - 4; i++) {
-    if (tail[i]?.role === "assistant" && tail[i + 1]?.role === "tool") {
-      compressUpTo = i + 2;
+    const msg = tail[i];
+    const next = tail[i + 1];
+    if (msg?.role === "assistant" && next?.role === "tool") {
+      // Walk forward to collect all tool responses for this assistant turn
+      let j = i + 1;
+      while (j < tail.length && tail[j]?.role === "tool") j++;
+      compressUpTo = j;
       pairs++;
-      if (pairs >= 3) break; // compress up to 3 pairs at once
+      if (pairs >= 3) break; // compress up to 3 assistant→tool groups at once
     }
   }
 
   if (compressUpTo === 0) return messages;
 
+  // Use role "system" so it never creates an invalid user→tool or user→assistant sequence
   const compressed: ModelMessage = {
-    role: "user",
-    content: `[${compressUpTo} earlier messages compressed to save context. The agent has already made progress on the task. Continue from the current state.]`,
+    role: "system",
+    content: `[Context compacted: ${compressUpTo} earlier messages summarised to save context. The agent has already made progress on the task. Continue from the current state.]`,
   };
 
   return [...header, compressed, ...tail.slice(compressUpTo)];
@@ -220,6 +229,14 @@ export class CodingAgent {
       // Fresh start — generate a real plan using the model if requested
       options.onEvent?.({ type: "plan.started" });
 
+      const facts = await MemoryStore.load(context.repositoryPath);
+      let memoryNote = "";
+      if (Object.keys(facts).length > 0) {
+        memoryNote = `\n\n## Learnt Facts & Settings (Memory)\n${Object.entries(facts)
+          .map(([k, v]) => `- ${k}: ${v}`)
+          .join("\n")}`;
+      }
+
       let generatedPlan = `Task: ${task}\n\nRepository context:\n${options.repositoryContext ?? "(not provided)"}`;
 
       if (options.enablePlanning) {
@@ -237,6 +254,10 @@ export class CodingAgent {
               },
             ],
             tools: [],
+            onToken: (token) => {
+              // Stream planner tokens so the terminal shows progress during planning
+              options.onEvent?.({ type: "model.token", step: 0, token });
+            },
           });
           if (plannerResponse.content) {
             generatedPlan = plannerResponse.content;
@@ -248,7 +269,12 @@ export class CodingAgent {
 
       options.onEvent?.({ type: "plan.finished", plan: generatedPlan });
 
-      const planNote = `Task: ${task}\n\nImplementation Plan:\n${generatedPlan}\n\nRepository Context:\n${options.repositoryContext ?? "(not provided)"}`;
+      // Only label it as an "Implementation Plan" when planning was actually enabled
+      // and produced a real plan (not just the fallback task description).
+      const planSection = options.enablePlanning
+        ? `Task: ${task}\n\nImplementation Plan:\n${generatedPlan}`
+        : `Task: ${task}`;
+      const planNote = `${planSection}${memoryNote}\n\nRepository Context:\n${options.repositoryContext ?? "(not provided)"}`;
 
       messages.push(
         { role: "system", content: SYSTEM_PROMPT },
@@ -313,6 +339,32 @@ export class CodingAgent {
       });
 
       if (response.toolCalls.length === 0) {
+        // Detect whether this looks like a premature stop on the very first response.
+        // Only push back if: step 0 (no tools were called yet in this run) AND the
+        // message history shows no previous tool calls AND the content doesn't look like
+        // a deliberate info-only response (e.g. answering a question).
+        const content = response.content ?? "";
+        const hasPriorToolCalls = messages.some((m) => m.role === "tool");
+        const looksLikeInfoResponse =
+          content.length < 200 || // very short responses are probably answers or errors
+          /\b(error|fail|denied|cannot|unable|permission|not found|doesn't exist)\b/i.test(
+            content,
+          ) ||
+          /\b(here is|here's|this is|the answer|in summary|to answer)\b/i.test(content);
+
+        const shouldPushBack =
+          step === 0 && !hasPriorToolCalls && !changedFiles && !looksLikeInfoResponse;
+
+        if (shouldPushBack && step < maxSteps - 2) {
+          // Push back — the model stopped on step 0 without taking any action
+          messages.push({
+            role: "user",
+            content:
+              "You stopped without using any tools. The task is not yet complete. Please continue by calling the appropriate tools to make progress.",
+          });
+          continue;
+        }
+
         // Model wants to stop — run verification if files changed
         if (
           changedFiles &&
@@ -351,7 +403,12 @@ export class CodingAgent {
       const toolResults = await Promise.all(
         response.toolCalls.map(async (call) => {
           context.signal?.throwIfAborted();
-          options.onEvent?.({ type: "tool.started", step: step + 1, toolName: call.name });
+          options.onEvent?.({
+            type: "tool.started",
+            step: step + 1,
+            toolName: call.name,
+            args: call.arguments as Record<string, unknown>,
+          });
 
           const result = await this.tools.execute(call.name, call.arguments, context);
 

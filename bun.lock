@@ -37,6 +37,8 @@
       "name": "@forge/agent",
       "version": "0.1.0",
       "dependencies": {
+        "@forge/memory": "workspace:*",
+        "@forge/runtime": "workspace:*",
         "@forge/tools": "workspace:*",
         "@forge/types": "workspace:*",
         "zod": "^4.4.3",
@@ -48,6 +50,10 @@
     },
     "packages/events": {
       "name": "@forge/events",
+      "version": "0.1.0",
+    },
+    "packages/memory": {
+      "name": "@forge/memory",
       "version": "0.1.0",
     },
     "packages/models": {
@@ -68,12 +74,18 @@
     "packages/session": {
       "name": "@forge/session",
       "version": "0.1.0",
+      "dependencies": {
+        "@forge/events": "workspace:*",
+        "@forge/types": "workspace:*",
+      },
     },
     "packages/tools": {
       "name": "@forge/tools",
       "version": "0.1.0",
       "dependencies": {
+        "@forge/memory": "workspace:*",
         "@forge/types": "workspace:*",
+        "typescript": "^5.7.3",
         "zod": "^4.4.3",
       },
     },
@@ -160,6 +172,8 @@
     "@forge/context": ["@forge/context@workspace:packages/context"],
 
     "@forge/events": ["@forge/events@workspace:packages/events"],
+
+    "@forge/memory": ["@forge/memory@workspace:packages/memory"],
 
     "@forge/models": ["@forge/models@workspace:packages/models"],
 

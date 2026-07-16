@@ -2,6 +2,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
+import { MemoryStore } from "@forge/memory";
 import type { Tool, ToolExecutionContext, ToolResult } from "@forge/types";
 import ts from "typescript";
 import { z } from "zod";
@@ -164,6 +165,23 @@ const searchCodeInputSchema = z.object({
   caseSensitive: z.boolean().default(true),
   isRegex: z.boolean().default(false),
 });
+
+const rememberFactInputSchema = z.object({
+  key: z
+    .string()
+    .min(1)
+    .describe("The unique name/key for this memory, e.g. 'python_path' or 'user_preferences'."),
+  value: z.string().min(1).describe("The facts, settings, or learnings to store for this key."),
+});
+
+const forgetFactInputSchema = z.object({
+  key: z
+    .string()
+    .min(1)
+    .describe("The key to delete from memory. Use recall_facts first to see all stored keys."),
+});
+
+const recallFactsInputSchema = z.object({});
 
 const gitCommitInputSchema = z.object({
   message: z.string().min(1),
@@ -736,13 +754,21 @@ function applyHunk(
   const insertAt = hunk.startLine - 1 + offset;
   const removals = hunk.lines.filter((l) => l.startsWith("-")).map((l) => l.slice(1));
   const additions = hunk.lines.filter((l) => l.startsWith("+")).map((l) => l.slice(1));
-  const context = hunk.lines.filter((l) => l.startsWith(" ")).map((l) => l.slice(1));
+  const contextLines = hunk.lines.filter((l) => l.startsWith(" ")).map((l) => l.slice(1));
 
-  // Verify context lines match
-  const searchStart = insertAt;
-  let contextIdx = 0;
-  for (let i = insertAt; i < fileLines.length && contextIdx < context.length; i++) {
-    if (fileLines[i] === context[contextIdx]) contextIdx++;
+  // Verify context lines exist in the file near the target position
+  // Allow a ±5 line fuzzy window to account for prior hunk offsets
+  if (contextLines.length > 0) {
+    const searchStart = Math.max(0, insertAt - 5);
+    const searchEnd = Math.min(fileLines.length, insertAt + removals.length + 5);
+    let contextIdx = 0;
+    for (let i = searchStart; i < searchEnd && contextIdx < contextLines.length; i++) {
+      if (fileLines[i] === contextLines[contextIdx]) contextIdx++;
+    }
+    // If not all context lines were found, reject the hunk
+    if (contextIdx < contextLines.length) {
+      return { success: false, offset: 0 };
+    }
   }
 
   // Find block to replace
@@ -753,7 +779,7 @@ function applyHunk(
     return { success: false, offset: 0 };
   }
 
-  // Remove lines
+  // Remove lines and insert additions
   fileLines.splice(startIdx, removeCount, ...additions);
   return { success: true, offset: additions.length - removeCount };
 }
@@ -1055,6 +1081,59 @@ export const gitCommitTool: RegisteredTool<{ message: string; paths: string[] },
   },
 };
 
+export const rememberFactTool: RegisteredTool<
+  { key: string; value: string },
+  Record<string, string>
+> = {
+  name: "remember_fact",
+  description:
+    "Save a key fact, instruction, preference, or environment detail to the persistent memory.",
+  permission: "write",
+  inputSchema: rememberFactInputSchema,
+  async execute({ key, value }, context) {
+    const startedAt = performance.now();
+    try {
+      const facts = await MemoryStore.remember(context.repositoryPath, key, value);
+      return success(facts, startedAt);
+    } catch (error) {
+      return failure(toMessage(error), startedAt);
+    }
+  },
+};
+
+export const recallFactsTool: RegisteredTool<Record<string, never>, Record<string, string>> = {
+  name: "recall_facts",
+  description: "Recall all stored key facts, instructions, preferences, and environment details.",
+  permission: "read",
+  inputSchema: recallFactsInputSchema,
+  async execute(_, context) {
+    const startedAt = performance.now();
+    try {
+      const facts = await MemoryStore.load(context.repositoryPath);
+      return success(facts, startedAt);
+    } catch (error) {
+      return failure(toMessage(error), startedAt);
+    }
+  },
+};
+
+export const forgetFactTool: RegisteredTool<{ key: string }, Record<string, string>> = {
+  name: "forget_fact",
+  description:
+    "Delete a stored fact or setting from persistent memory by its key. Use recall_facts first to see what is stored.",
+  permission: "write",
+  inputSchema: forgetFactInputSchema,
+  async execute({ key }, context) {
+    const startedAt = performance.now();
+    try {
+      const facts = await MemoryStore.forget(context.repositoryPath, key);
+      return success(facts, startedAt);
+    } catch (error) {
+      return failure(toMessage(error), startedAt);
+    }
+  },
+};
+
 // ─── Tool result formatting for LLM consumption ──────────────────────────────
 
 /**
@@ -1070,6 +1149,29 @@ export function formatToolResult(toolName: string, result: ToolResult): string {
   if (!data) return `✅ ${toolName} succeeded.`;
 
   switch (toolName) {
+    case "remember_fact": {
+      const facts = data as Record<string, string>;
+      return `🧠 Saved fact. Current stored facts:\n${Object.entries(facts)
+        .map(([k, v]) => `- ${k}: ${v}`)
+        .join("\n")}`;
+    }
+
+    case "recall_facts": {
+      const facts = data as Record<string, string>;
+      if (Object.keys(facts).length === 0) return "🧠 No facts stored in memory yet.";
+      return `🧠 Recalled facts:\n${Object.entries(facts)
+        .map(([k, v]) => `- ${k}: ${v}`)
+        .join("\n")}`;
+    }
+
+    case "forget_fact": {
+      const facts = data as Record<string, string>;
+      if (Object.keys(facts).length === 0) return "🧠 Fact deleted. Memory is now empty.";
+      return `🧠 Fact deleted. Remaining facts:\n${Object.entries(facts)
+        .map(([k, v]) => `- ${k}: ${v}`)
+        .join("\n")}`;
+    }
+
     case "read_file": {
       const d = data as unknown as ReadFileData;
       const rangeNote =
@@ -1182,7 +1284,9 @@ function resolveRepositoryPath(repositoryPath: string, requestedPath: string): s
   if (relativePath === "" || (!relativePath.startsWith(`..${sep}`) && relativePath !== "..")) {
     return candidate;
   }
-  throw new Error("Path must remain within the active repository.");
+  throw new Error(
+    `Path must remain within the repository root (${root}). Rejected path: ${candidate}. Use a path relative to the repository root, e.g. "sandbox/todo.py".`,
+  );
 }
 
 function success<TData>(data: TData, startedAt: number): ToolResult<TData> {

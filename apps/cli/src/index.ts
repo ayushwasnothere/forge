@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import * as path from "node:path";
 import * as readline from "node:readline";
 import { CodingAgent } from "@forge/agent";
 import { RepositoryContextBuilder } from "@forge/context";
@@ -10,6 +11,7 @@ import {
   ToolRegistry,
   applyPatchTool,
   findFilesTool,
+  forgetFactTool,
   formatToolResult,
   gitBlameTool,
   gitCommitTool,
@@ -19,6 +21,8 @@ import {
   listDirectoryTool,
   listSymbolsTool,
   readFileTool,
+  recallFactsTool,
+  rememberFactTool,
   replaceTextTool,
   runCommandTool,
   searchCodeTool,
@@ -26,7 +30,17 @@ import {
 } from "@forge/tools";
 import type { ModelMessage } from "@forge/types";
 import { Command } from "commander";
-import { printHeader, printThinking, printToolEnd, printToolStart, renderMarkdown } from "./tui";
+import {
+  Spinner,
+  clearStreamedText,
+  printBanner,
+  printHeader,
+  printPlanningFooter,
+  printPlanningHeader,
+  printToolResult,
+  renderMarkdown,
+  toolArgPreview,
+} from "./tui";
 
 const program = new Command();
 
@@ -132,21 +146,6 @@ function printVisualDiff(filename: string, newContent: string, oldContent?: stri
   }
 }
 
-function clearStreamedText(streamedText: string): void {
-  if (!streamedText) return;
-  const columns = process.stdout.columns || 80;
-  const lines = streamedText.split("\n");
-  let lineCount = 0;
-  for (const line of lines) {
-    lineCount += Math.max(1, Math.ceil(line.length / columns));
-  }
-  const moveUp = lineCount - 1;
-  if (moveUp > 0) {
-    process.stdout.write(`\x1b[${moveUp}A`);
-  }
-  process.stdout.write("\r\x1b[J");
-}
-
 program
   .name("forge")
   .description("A modular, terminal-first AI coding-agent runtime")
@@ -238,6 +237,7 @@ program
   .option("--provider <name>", "openrouter, openai, grok, anthropic, or ollama")
   .option("--session <id>", "resume a saved Forge session")
   .option("--verbose", "print raw tool output alongside formatted summaries")
+  .option("--workspace <path>", "root workspace directory", "sandbox")
   .action(
     async (
       task: string | undefined,
@@ -249,8 +249,10 @@ program
         provider?: string;
         session?: string;
         verbose?: boolean;
+        workspace: string;
       },
     ) => {
+      const workspacePath = path.resolve(process.cwd(), options.workspace);
       if (!task && !options.session) {
         console.error("Error: Please provide a task argument or a --session <id> to resume.");
         process.exitCode = 1;
@@ -278,11 +280,14 @@ program
         gitLogTool,
         gitBlameTool,
         gitCommitTool,
+        rememberFactTool,
+        recallFactsTool,
+        forgetFactTool,
       ];
       for (const tool of tools) {
         registry.register(tool);
       }
-      await loadExternalTools(registry, process.cwd());
+      await loadExternalTools(registry, workspacePath);
       const agent = new CodingAgent(
         createProvider({
           provider,
@@ -297,7 +302,7 @@ program
         options.allowExecute ? "execute" : undefined,
       ].filter((value): value is "write" | "execute" => value !== undefined);
 
-      const store = new SessionStore(process.cwd());
+      const store = new SessionStore(workspacePath);
       const sessionId = options.session ?? crypto.randomUUID();
       let loadedSession: StoredSession | undefined;
       let history: ModelMessage[] = [];
@@ -376,12 +381,14 @@ program
       process.once("SIGINT", cancel);
 
       try {
-        const ctxResult = await new RepositoryContextBuilder().buildStructured(process.cwd());
+        const ctxResult = await new RepositoryContextBuilder().buildStructured(workspacePath);
         const repositoryContext = ctxResult.text;
-        if (ctxResult.gitBranch) {
-          console.log(`🌿 Branch: ${ctxResult.gitBranch}`);
-        }
-        console.log(`🔬 Test command: ${ctxResult.testCommand}`);
+        printBanner({
+          model,
+          ...(ctxResult.gitBranch ? { branch: ctxResult.gitBranch } : {}),
+          ...(ctxResult.testCommand ? { testCommand: ctxResult.testCommand } : {}),
+          sessionId: taskId,
+        });
 
         runtime.events.publish({
           type: "task.created",
@@ -392,10 +399,14 @@ program
 
         let stepHadContent = false;
         let agentStreamedText = "";
+        const spinner = new Spinner();
+        const toolTimers = new Map<string, number>();
+        const toolArgs = new Map<string, Record<string, unknown>>();
+
         const answer = await agent.run(
           agentTask,
           {
-            repositoryPath: process.cwd(),
+            repositoryPath: workspacePath,
             allowedPermissions: permissions,
             commandTimeoutMs: Number(options.commandTimeout) * 1000,
             signal: controller.signal,
@@ -411,12 +422,12 @@ program
             onEvent: (event) => {
               const now = new Date().toISOString();
               if (event.type === "plan.started") {
-                printHeader("Planning Phase");
+                printPlanningHeader();
                 runtime.events.publish({ type: "plan.started", taskId, timestamp: now });
               }
               if (event.type === "plan.finished") {
                 plan = event.plan;
-                console.log(renderMarkdown(plan));
+                printPlanningFooter(agentStreamedText, plan);
                 runtime.events.publish({
                   type: "plan.finished",
                   taskId,
@@ -427,7 +438,7 @@ program
               if (event.type === "model.started") {
                 stepHadContent = false;
                 agentStreamedText = "";
-                printThinking(event.step);
+                spinner.start(event.step > 0 ? "thinking…" : "analyzing request…");
                 runtime.events.publish({
                   type: "model.started",
                   taskId,
@@ -436,11 +447,13 @@ program
                 });
               }
               if (event.type === "model.token") {
+                spinner.stop();
                 stepHadContent = true;
                 agentStreamedText += event.token;
                 process.stdout.write(event.token);
               }
               if (event.type === "model.finished") {
+                spinner.stop();
                 if (stepHadContent) {
                   clearStreamedText(agentStreamedText);
                   console.log(renderMarkdown(agentStreamedText));
@@ -454,7 +467,8 @@ program
                 });
               }
               if (event.type === "tool.started") {
-                printToolStart(event.step, event.toolName);
+                toolTimers.set(event.toolName, Date.now());
+                toolArgs.set(event.toolName, event.args ?? {});
                 runtime.events.publish({
                   type: "tool.started",
                   taskId,
@@ -464,7 +478,14 @@ program
                 });
               }
               if (event.type === "tool.finished") {
-                printToolEnd(event.success);
+                const duration = Date.now() - (toolTimers.get(event.toolName) ?? Date.now());
+                const args = toolArgs.get(event.toolName) ?? {};
+                printToolResult(
+                  event.toolName,
+                  toolArgPreview(event.toolName, args),
+                  event.success,
+                  duration,
+                );
                 runtime.events.publish({
                   type: "tool.finished",
                   taskId,
@@ -536,6 +557,7 @@ program
   .option("--provider <name>", "openrouter, openai, grok, anthropic, or ollama")
   .option("--session <id>", "resume a saved Forge session")
   .option("--verbose", "print raw tool output alongside formatted summaries")
+  .option("--workspace <path>", "root workspace directory", "sandbox")
   .action(
     async (options: {
       allowWrite?: boolean;
@@ -545,7 +567,9 @@ program
       provider?: string;
       session?: string;
       verbose?: boolean;
+      workspace: string;
     }) => {
+      const workspacePath = path.resolve(process.cwd(), options.workspace);
       const apiKey = process.env.FORGE_API_KEY;
       let currentModel = process.env.FORGE_MODEL ?? "";
       let currentProvider = (options.provider ??
@@ -568,11 +592,14 @@ program
         gitLogTool,
         gitBlameTool,
         gitCommitTool,
+        rememberFactTool,
+        recallFactsTool,
+        forgetFactTool,
       ];
       for (const tool of tools) {
         registry.register(tool);
       }
-      await loadExternalTools(registry, process.cwd());
+      await loadExternalTools(registry, workspacePath);
       let agent = new CodingAgent(
         createProvider({
           provider: currentProvider,
@@ -587,7 +614,7 @@ program
         options.allowExecute ? "execute" : undefined,
       ].filter((value): value is "write" | "execute" => value !== undefined);
 
-      const store = new SessionStore(process.cwd());
+      const store = new SessionStore(workspacePath);
       let sessionId = options.session ?? crypto.randomUUID();
       let loadedSession: StoredSession | undefined;
       let plan = "";
@@ -655,6 +682,7 @@ program
 
       let activeController: AbortController | undefined;
       let isAgentRunning = false;
+      let hasPlanned = false; // Only plan on the first turn of each session
 
       const sigintHandler = () => {
         if (isAgentRunning && activeController) {
@@ -669,17 +697,14 @@ program
       process.on("SIGINT", sigintHandler);
 
       try {
-        const ctxResult = await new RepositoryContextBuilder().buildStructured(process.cwd());
+        const ctxResult = await new RepositoryContextBuilder().buildStructured(workspacePath);
         const repositoryContext = ctxResult.text;
-        if (ctxResult.gitBranch) {
-          console.log(`🌿 Branch: ${ctxResult.gitBranch}`);
-        }
-        console.log(`🔬 Test command: ${ctxResult.testCommand}`);
-
-        console.log(`\n💬 Forge Interactive Chat (Session ID: ${sessionId})`);
-        console.log(
-          "Type your prompt and press Enter. Special commands: /exit, /quit, /history, /diff, /reset, /help\n",
-        );
+        printBanner({
+          model: currentModel,
+          ...(ctxResult.gitBranch ? { branch: ctxResult.gitBranch } : {}),
+          ...(ctxResult.testCommand ? { testCommand: ctxResult.testCommand } : {}),
+          sessionId,
+        });
 
         const rl = readline.createInterface({
           input: process.stdin,
@@ -705,9 +730,21 @@ program
                   "  /resume [id] - List or load a saved session\n" +
                   "  /provider [p] [m] - Show, switch, or configure model provider\n" +
                   "  /model [name] - Show or change the active LLM model\n" +
+                  "  /status      - Show current session status\n" +
                   "  /history     - Print active messages in current chat\n" +
                   "  /diff        - View unstaged repository changes\n" +
                   "  /reset       - Clear active chat history",
+              );
+              promptUser();
+              return;
+            }
+            if (input === "/status") {
+              const msgCount = agent.messages.length;
+              const { MemoryStore: MS } = await import("@forge/memory");
+              const facts = await MS.load(workspacePath);
+              const factCount = Object.keys(facts).length;
+              console.log(
+                `\n📊 Session Status\n  Session ID : ${sessionId}\n  Provider   : ${currentProvider}\n  Model      : ${currentModel}\n  Messages   : ${msgCount}\n  Branch     : ${ctxResult.gitBranch ?? "(not a git repo)"}\n  Memory     : ${factCount} fact(s) stored\n  Planned    : ${hasPlanned ? "yes" : "no (will plan on next turn)"}`,
               );
               promptUser();
               return;
@@ -771,6 +808,7 @@ program
             if (input === "/new") {
               agent.messages = [];
               plan = "";
+              hasPlanned = false;
               sessionId = crypto.randomUUID();
               loadedSession = undefined;
               console.log(`✨ New session started (ID: ${sessionId}).`);
@@ -828,7 +866,7 @@ program
               const diffResult = await registry.execute(
                 "git_diff",
                 { staged: false },
-                { repositoryPath: process.cwd() },
+                { repositoryPath: workspacePath },
               );
               console.log(formatToolResult("git_diff", diffResult));
               promptUser();
@@ -836,6 +874,7 @@ program
             }
             if (input === "/reset") {
               agent.messages = [];
+              hasPlanned = false;
               console.log("Chat history cleared.");
               promptUser();
               return;
@@ -852,12 +891,16 @@ program
             activeController = new AbortController();
             let chatStepHadContent = false;
             let chatStreamedText = "";
+            const spinner = new Spinner();
+            const toolTimers = new Map<string, number>();
+            const toolArgs = new Map<string, Record<string, unknown>>();
 
             try {
+              const shouldPlan = !hasPlanned;
               const answer = await agent.run(
                 input,
                 {
-                  repositoryPath: process.cwd(),
+                  repositoryPath: workspacePath,
                   allowedPermissions: permissions,
                   commandTimeoutMs: Number(options.commandTimeout) * 1000,
                   signal: activeController.signal,
@@ -868,17 +911,17 @@ program
                 {
                   maxSteps: Number(options.maxSteps),
                   repositoryContext,
-                  history: agent.messages,
-                  enablePlanning: true,
+                  history: [],
+                  enablePlanning: shouldPlan,
                   onEvent: (event) => {
                     const now = new Date().toISOString();
                     if (event.type === "plan.started") {
-                      printHeader("Planning Phase");
+                      printPlanningHeader();
                       runtime.events.publish({ type: "plan.started", taskId, timestamp: now });
                     }
                     if (event.type === "plan.finished") {
                       plan = event.plan;
-                      console.log(renderMarkdown(plan));
+                      printPlanningFooter(chatStreamedText, plan);
                       runtime.events.publish({
                         type: "plan.finished",
                         taskId,
@@ -889,7 +932,7 @@ program
                     if (event.type === "model.started") {
                       chatStepHadContent = false;
                       chatStreamedText = "";
-                      printThinking(event.step);
+                      spinner.start(event.step > 0 ? "thinking…" : "analyzing request…");
                       runtime.events.publish({
                         type: "model.started",
                         taskId,
@@ -898,11 +941,13 @@ program
                       });
                     }
                     if (event.type === "model.token") {
+                      spinner.stop();
                       chatStepHadContent = true;
                       chatStreamedText += event.token;
                       process.stdout.write(event.token);
                     }
                     if (event.type === "model.finished") {
+                      spinner.stop();
                       if (chatStepHadContent) {
                         clearStreamedText(chatStreamedText);
                         console.log(renderMarkdown(chatStreamedText));
@@ -916,7 +961,8 @@ program
                       });
                     }
                     if (event.type === "tool.started") {
-                      printToolStart(event.step, event.toolName);
+                      toolTimers.set(event.toolName, Date.now());
+                      toolArgs.set(event.toolName, event.args ?? {});
                       runtime.events.publish({
                         type: "tool.started",
                         taskId,
@@ -926,7 +972,14 @@ program
                       });
                     }
                     if (event.type === "tool.finished") {
-                      printToolEnd(event.success);
+                      const duration = Date.now() - (toolTimers.get(event.toolName) ?? Date.now());
+                      const args = toolArgs.get(event.toolName) ?? {};
+                      printToolResult(
+                        event.toolName,
+                        toolArgPreview(event.toolName, args),
+                        event.success,
+                        duration,
+                      );
                       runtime.events.publish({
                         type: "tool.finished",
                         taskId,
@@ -940,6 +993,7 @@ program
                 },
               );
 
+              hasPlanned = true; // Don't plan again for subsequent turns
               runtime.events.publish({
                 type: "task.completed",
                 taskId,

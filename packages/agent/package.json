@@ -5,6 +5,7 @@
   "type": "module",
   "exports": "./src/index.ts",
   "dependencies": {
+    "@forge/memory": "workspace:*",
     "@forge/runtime": "workspace:*",
     "@forge/tools": "workspace:*",
     "@forge/types": "workspace:*",

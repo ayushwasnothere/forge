@@ -91,10 +91,9 @@ describe("ToolRegistry", () => {
       { path: "../outside.txt" },
       { repositoryPath },
     );
-    expect(escapeResult).toMatchObject({
-      success: false,
-      error: "Path must remain within the active repository.",
-    });
+    expect(escapeResult.success).toBe(false);
+    expect(escapeResult.error).toContain("Path must remain within the repository root");
+    expect(escapeResult.error).toContain("outside.txt");
   });
 
   it("lists directories in a stable order with recursive support", async () => {
