@@ -237,7 +237,7 @@ program
   .option("--provider <name>", "openrouter, openai, grok, anthropic, or ollama")
   .option("--session <id>", "resume a saved Forge session")
   .option("--verbose", "print raw tool output alongside formatted summaries")
-  .option("--workspace <path>", "root workspace directory", "sandbox")
+  .option("--workspace <path>", "root workspace directory", ".")
   .action(
     async (
       task: string | undefined,
@@ -557,7 +557,7 @@ program
   .option("--provider <name>", "openrouter, openai, grok, anthropic, or ollama")
   .option("--session <id>", "resume a saved Forge session")
   .option("--verbose", "print raw tool output alongside formatted summaries")
-  .option("--workspace <path>", "root workspace directory", "sandbox")
+  .option("--workspace <path>", "root workspace directory", ".")
   .action(
     async (options: {
       allowWrite?: boolean;

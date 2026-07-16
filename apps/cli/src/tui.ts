@@ -84,35 +84,12 @@ export class Spinner {
 
 // ─── Banner ───────────────────────────────────────────────────────────────────
 
-/** Valid agent "direction" steering modes cycled by the /direction command. */
-export type Direction = "Explore" | "Implement" | "Review";
-
-/** Valid agent "speed" levels (1 = slow/cautious … 10 = fast/aggressive). */
-export const SPEED_MIN = 1;
-export const SPEED_MAX = 10;
-export const DEFAULT_SPEED = 5;
-
-/** Renders a clickable-looking control "button" with a label and current value. */
-function button(icon: string, label: string, value: string): string {
-  return `${bgGray}${bo} ${icon} ${label}: ${value} ${rs}`;
-}
-
-/** Renders the direction + speed control buttons shown in the session banner. */
-export function printButtons(opts: { direction: Direction; speed: number }): void {
-  const dirBtn = button("↻", "Direction", opts.direction);
-  const speedBtn = button("⚡", "Speed", `${opts.speed}/10`);
-  const hint = `${dm}change with ${gray}/direction${rs}${dm} · ${gray}/speed${rs}${rs}`;
-  console.log(`  ${dirBtn}  ${speedBtn}   ${hint}`);
-}
-
 /** Prints the compact session banner shown at the start of a chat session. */
 export function printBanner(opts: {
   model: string;
   branch?: string;
   testCommand?: string;
   sessionId: string;
-  direction?: Direction;
-  speed?: number;
 }): void {
   const w = cols();
   const rule = `${dm}${"─".repeat(w)}${rs}`;
@@ -132,10 +109,6 @@ export function printBanner(opts: {
     `  ${dm}Session ${gray}${opts.sessionId.slice(0, 8)}…${rs}   ` +
       `${dm}Commands: ${gray}/help /status /new /reset /exit${rs}`,
   );
-  printButtons({
-    direction: opts.direction ?? "Explore",
-    speed: opts.speed ?? DEFAULT_SPEED,
-  });
   console.log();
 }
 
