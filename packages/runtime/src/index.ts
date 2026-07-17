@@ -3,7 +3,6 @@ import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { EventBus } from "@forge/events";
-import type { Session, Task } from "@forge/types";
 
 export type HealthStatus = "healthy" | "degraded" | "unhealthy";
 export type CheckStatus = "pass" | "warn" | "fail";
@@ -22,19 +21,9 @@ export interface HealthReport {
 
 export class AgentRuntime {
   readonly events = new EventBus();
-  private session: Session | undefined;
-  private task: Task | undefined;
 
   statusMessage(): string {
-    if (!this.session) {
-      return "No session active.";
-    }
-
-    if (!this.task) {
-      return `Session ${this.session.id} is ready.`;
-    }
-
-    return `Task is ${this.task.status}.`;
+    return "No session active in the current directory.";
   }
 
   async healthCheck(repositoryPath: string): Promise<HealthReport> {
@@ -100,7 +89,7 @@ async function gitRepositoryCheck(repositoryPath: string): Promise<HealthCheck> 
   }
 }
 
-export async function detectTestCommand(repositoryPath: string): Promise<string> {
+export async function detectTestCommand(repositoryPath: string): Promise<string | null> {
   const exists = async (path: string) =>
     stat(join(repositoryPath, path))
       .then(() => true)
@@ -140,7 +129,7 @@ export async function detectTestCommand(repositoryPath: string): Promise<string>
   ) {
     return "pytest";
   }
-  return "bun run test";
+  return null;
 }
 
 export { DockerSandboxRunner } from "./sandbox";

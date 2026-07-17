@@ -2,8 +2,6 @@ export type ForgeEvent =
   | { type: "task.created"; taskId: string; goal: string; timestamp: string }
   | { type: "task.completed"; taskId: string; result: string; timestamp: string }
   | { type: "task.failed"; taskId: string; error: string; timestamp: string }
-  | { type: "plan.started"; taskId: string; timestamp: string }
-  | { type: "plan.finished"; taskId: string; plan: string; timestamp: string }
   | { type: "model.started"; taskId: string; step: number; timestamp: string }
   | {
       type: "model.finished";

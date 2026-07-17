@@ -17,6 +17,7 @@ describe("SessionStore", () => {
     const session = {
       id: "session-1",
       task: "Test task",
+      repositoryPath: repoPath,
       plan: "1. Do work",
       result: "Success",
       createdAt: new Date().toISOString(),

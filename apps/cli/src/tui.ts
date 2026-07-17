@@ -2,138 +2,19 @@
  * apps/cli/src/tui.ts
  *
  * Modern terminal UI for Forge.
- * Design inspired by Claude Code / OpenCode:
- *   - Animated braille spinner for model thinking
- *   - Compact tool result lines with icon, preview, timing
- *   - Boxed planning section with live streaming
- *   - Rich markdown rendering (headers, lists, code blocks, inline)
- *   - Clean banner with session metadata
+ * Uses @clack/prompts for interactive components and picocolors for styling.
  */
 
-// ─── ANSI escape codes ────────────────────────────────────────────────────────
-const rs = "\x1b[0m"; // reset all
-const bo = "\x1b[1m"; // bold
-const dm = "\x1b[2m"; // dim
-const it = "\x1b[3m"; // italic
-const un = "\x1b[4m"; // underline
-
-const green = "\x1b[32m";
-const cyan = "\x1b[36m";
-const gray = "\x1b[90m"; // bright black / dark gray
-
-const bRed = "\x1b[91m";
-const bGreen = "\x1b[92m";
-const bYellow = "\x1b[93m";
-const bCyan = "\x1b[96m";
-const bWhite = "\x1b[97m";
-
-const bgGray = "\x1b[100m"; // dark background for inline code
+import pc from "picocolors";
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 /** Effective terminal width, capped at 120 columns for readability. */
-const cols = (): number => Math.min(process.stdout.columns || 80, 120);
+export const cols = (): number => Math.min(process.stdout.columns || 80, 120);
 
 /** Truncates a string with an ellipsis when it exceeds max characters. */
-function trunc(s: string, max: number): string {
+export function trunc(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max)}…` : s;
-}
-
-// ─── Spinner ──────────────────────────────────────────────────────────────────
-
-/**
- * Animated braille dot spinner that overwrites a single terminal line.
- * Used to show that the model is thinking between tool rounds.
- */
-export class Spinner {
-  private static readonly FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-  private frame = 0;
-  private timer: ReturnType<typeof setInterval> | undefined;
-  private running = false;
-
-  start(label: string): void {
-    this.stop();
-    this.frame = 0;
-    this.running = true;
-    this.tick(label);
-    this.timer = setInterval(() => this.tick(label), 80);
-  }
-
-  private tick(label: string): void {
-    const f = Spinner.FRAMES[this.frame % Spinner.FRAMES.length] ?? "⠋";
-    process.stdout.write(`\r  ${gray}${f}${rs}  ${dm}${label}${rs}`);
-    this.frame++;
-  }
-
-  /** Clears the spinner line. Returns true if the spinner was active. */
-  stop(): boolean {
-    if (!this.running) return false;
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = undefined;
-    }
-    process.stdout.write("\r\x1b[2K"); // CR + erase entire line
-    this.running = false;
-    return true;
-  }
-
-  get isRunning(): boolean {
-    return this.running;
-  }
-}
-
-// ─── Banner ───────────────────────────────────────────────────────────────────
-
-/** Prints the compact session banner shown at the start of a chat session. */
-export function printBanner(opts: {
-  model: string;
-  branch?: string;
-  testCommand?: string;
-  sessionId: string;
-}): void {
-  const w = cols();
-  const rule = `${dm}${"─".repeat(w)}${rs}`;
-  const sep = `  ${gray}│${rs}  `;
-  const title = `  ${bo}${bCyan}⚡ forge${rs}`;
-  const parts = [
-    `${dm}${opts.model}${rs}`,
-    opts.branch ? `${gray}⎇ ${opts.branch}${rs}` : null,
-    opts.testCommand ? `${dm}${opts.testCommand}${rs}` : null,
-  ].filter(Boolean) as string[];
-
-  console.log();
-  console.log(rule);
-  console.log(`${title}${sep}${parts.join(sep)}`);
-  console.log(rule);
-  console.log(
-    `  ${dm}Session ${gray}${opts.sessionId.slice(0, 8)}…${rs}   ` +
-      `${dm}Commands: ${gray}/help /status /new /reset /exit${rs}`,
-  );
-  console.log();
-}
-
-// ─── Planning section ─────────────────────────────────────────────────────────
-
-/** Prints the planning section header before the plan begins streaming. */
-export function printPlanningHeader(): void {
-  const dashes = `${dm}${"╌".repeat(cols() - 4)}${rs}`;
-  console.log(
-    `\n  ${bo}${bCyan}◆${rs} ${bo}Planning${rs}  ${dm}generating step-by-step plan…${rs}`,
-  );
-  console.log(`  ${dashes}`);
-}
-
-/**
- * Clears the streamed planning tokens and prints the rendered plan.
- * Called after plan.finished to replace raw streaming text with styled markdown.
- */
-export function printPlanningFooter(streamedText: string, renderedPlan: string): void {
-  clearStreamedText(streamedText);
-  const dashes = `${dm}${"╌".repeat(cols() - 4)}${rs}`;
-  for (const line of renderMarkdown(renderedPlan).split("\n")) {
-    process.stdout.write(`  ${line}\n`);
-  }
-  console.log(`  ${dashes}\n`);
 }
 
 // ─── Tool icons & argument preview ────────────────────────────────────────────
@@ -158,7 +39,7 @@ const TOOL_ICONS: Record<string, string> = {
   git_commit: "⎇",
 };
 
-function toolIcon(name: string): string {
+export function toolIcon(name: string): string {
   return TOOL_ICONS[name] ?? "◆";
 }
 
@@ -195,40 +76,6 @@ export function toolArgPreview(toolName: string, args: Record<string, unknown>):
   }
 }
 
-/**
- * Prints a compact tool completion line with icon, name, argument preview, and timing.
- * Emitted once when tool.finished fires (not tool.started) so parallel tool calls
- * each produce a clean, non-interleaved output line.
- *
- * Example:
- *   ✓ ○ read_file  packages/agent/src/index.ts  12ms
- *   ✓ ▷ run_command  bun run check  1.4s
- *   ✗ ▷ run_command  bun run test  2.1s
- */
-export function printToolResult(
-  toolName: string,
-  preview: string,
-  success: boolean,
-  durationMs: number,
-): void {
-  const icon = toolIcon(toolName);
-  const tick = success ? `${bGreen}✓${rs}` : `${bRed}✗${rs}`;
-  const dStr = durationMs < 1000 ? `${durationMs}ms` : `${(durationMs / 1000).toFixed(1)}s`;
-  const previewStr = preview ? `  ${dm}${preview}${rs}` : "";
-  console.log(
-    `    ${tick} ${gray}${icon}${rs} ${cyan}${toolName}${rs}${previewStr}  ${gray}${dStr}${rs}`,
-  );
-}
-
-// ─── Section header ───────────────────────────────────────────────────────────
-
-/** Prints a styled named section separator. */
-export function printHeader(title: string): void {
-  const w = cols();
-  console.log(`\n  ${bo}${bCyan}${title}${rs}`);
-  console.log(`  ${dm}${"─".repeat(w - 4)}${rs}`);
-}
-
 // ─── Markdown renderer ────────────────────────────────────────────────────────
 
 /**
@@ -250,48 +97,50 @@ export function renderMarkdown(md: string): string {
       if (inCode) {
         codeLang = line.slice(3).trim();
         const label = codeLang || "code";
-        const fill = "─".repeat(Math.max(2, 36 - label.length));
-        out.push(`${dm}  ╭─ ${label} ${fill}─${rs}`);
+        const borderWidth = Math.max(2, Math.min(cols() - 8, 44) - label.length - 4);
+        const fill = "─".repeat(borderWidth);
+        out.push(`${pc.dim(`  ╭─ ${label} ${fill}─`)}`);
       } else {
-        out.push(`${dm}  ╰${"─".repeat(42)}${rs}`);
+        const borderWidth = Math.max(2, Math.min(cols() - 8, 44) + 2);
+        out.push(`${pc.dim(`  ╰${"─".repeat(borderWidth)}`)}`);
         codeLang = "";
       }
       continue;
     }
     if (inCode) {
-      out.push(`${dm}  │${rs}  ${bYellow}${line}${rs}`);
+      out.push(`${pc.dim("  │")}  ${pc.yellowBright(line)}`);
       continue;
     }
 
     // ── Headers ───────────────────────────────────────────────────────────
     if (line.startsWith("# ")) {
       const t = line.slice(2);
-      out.push(`\n${bo}${bCyan}${t}${rs}`);
-      out.push(`${dm}${"─".repeat(Math.min(t.length + 4, cols()))}${rs}`);
+      out.push(`\n${pc.bold(pc.cyanBright(t))}`);
+      out.push(`${pc.dim("─".repeat(Math.min(t.length + 4, cols())))}`);
       continue;
     }
     if (line.startsWith("## ")) {
-      out.push(`\n${bo}${bWhite}${line.slice(3)}${rs}`);
+      out.push(`\n${pc.bold(pc.whiteBright(line.slice(3)))}`);
       continue;
     }
     if (line.startsWith("### ")) {
-      out.push(`\n${bo}${cyan}▸ ${line.slice(4)}${rs}`);
+      out.push(`\n${pc.bold(pc.cyan(`▸ ${line.slice(4)}`))}`);
       continue;
     }
     if (line.startsWith("#### ")) {
-      out.push(`${bo}${line.slice(5)}${rs}`);
+      out.push(`${pc.bold(line.slice(5))}`);
       continue;
     }
 
     // ── Horizontal rule ───────────────────────────────────────────────────
     if (/^(-{3,}|─{3,}|={3,})$/.test(line.trim())) {
-      out.push(`${dm}${"─".repeat(cols())}${rs}`);
+      out.push(`${pc.dim("─".repeat(cols()))}`);
       continue;
     }
 
     // ── Blockquote ────────────────────────────────────────────────────────
     if (line.startsWith("> ")) {
-      out.push(`  ${dm}│${rs} ${it}${gray}${line.slice(2)}${rs}`);
+      out.push(`  ${pc.dim("│")} ${pc.italic(pc.gray(line.slice(2)))}`);
       continue;
     }
 
@@ -302,7 +151,7 @@ export function renderMarkdown(md: string): string {
       const marker = listMatch[2] ?? "";
       const content = listMatch[3] ?? "";
       const isOrdered = /^\d+\.$/.test(marker);
-      const bullet = isOrdered ? `${cyan}${marker}${rs}` : `${green}◆${rs}`;
+      const bullet = isOrdered ? pc.cyan(marker) : pc.green("◆");
       out.push(`${indent}  ${bullet} ${inline(content)}`);
       continue;
     }
@@ -316,15 +165,19 @@ export function renderMarkdown(md: string): string {
 /** Renders inline Markdown tokens: bold, italic, inline code, links. */
 function inline(text: string): string {
   let f = text;
-  // Bold: **text** or __text__
-  f = f.replace(/(\*\*|__)(.*?)\1/g, `${bo}${bWhite}$2${rs}`);
-  // Italic: *text* (avoid matching ** by using negative lookahead)
-  f = f.replace(/(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)/g, `${it}$1${rs}`);
-  f = f.replace(/(?<!_)_(?!_)(.*?)(?<!_)_(?!_)/g, `${it}$1${rs}`);
+  // Bold: **text** or __text__ — use callback so capture groups are applied after ANSI wrapping
+  f = f.replace(/(?:\*\*|__)(.*?)(?:\*\*|__)/g, (_m, t: string) => pc.bold(pc.whiteBright(t)));
+  // Italic: *text* (avoid matching **)
+  f = f.replace(/(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)/g, (_m, t: string) => pc.italic(t));
+  f = f.replace(/(?<!_)_(?!_)(.*?)(?<!_)_(?!_)/g, (_m, t: string) => pc.italic(t));
   // Inline code: `code`
-  f = f.replace(/`([^`]+)`/g, `${bgGray}${bWhite} $1 ${rs}`);
+  f = f.replace(/`([^`]+)`/g, (_m, t: string) => pc.bgBlack(pc.whiteBright(` ${t} `)));
   // Links: [label](url)
-  f = f.replace(/\[([^\]]+)\]\(([^)]+)\)/g, `${un}${bCyan}$1${rs} ${dm}($2)${rs}`);
+  f = f.replace(
+    /\[([^\]]+)\]\(([^)]+)\)/g,
+    (_m, label: string, url: string) =>
+      `${pc.underline(pc.cyanBright(label))} ${pc.dim(`(${url})`)}`,
+  );
   return f;
 }
 
@@ -347,21 +200,69 @@ export function clearStreamedText(text: string): void {
   process.stdout.write("\r\x1b[J");
 }
 
-// ─── Legacy compatibility shims ───────────────────────────────────────────────
-// Kept so callers compile but all display logic now lives in the onEvent
-// handlers in apps/cli/src/index.ts.
+/**
+ * Returns an ANSI-colored string of the visual diff, which can be printed
+ * or passed to @clack/prompts note().
+ */
+export function generateVisualDiff(newContent: string, oldContent?: string): string {
+  const lines: string[] = [];
 
-/** @deprecated Spinner is now managed directly in index.ts. */
-export function printThinking(_step: number, _text?: string): void {
-  // no-op
-}
+  if (oldContent === undefined) {
+    lines.push(pc.green(`+ (New File: ${Buffer.byteLength(newContent)} bytes)`));
+    return lines.join("\n");
+  }
 
-/** @deprecated Tool display now handled by printToolResult in index.ts. */
-export function printToolStart(_step: number, _toolName: string): void {
-  // no-op
-}
+  const oldLines = oldContent.split("\n");
+  const newLines = newContent.split("\n");
 
-/** @deprecated Tool display now handled by printToolResult in index.ts. */
-export function printToolEnd(_success: boolean): void {
-  // no-op
+  let i = 0;
+  let j = 0;
+  let printedLines = 0;
+
+  while (i < oldLines.length || j < newLines.length) {
+    if (printedLines > 25) {
+      lines.push(pc.dim("... (remaining changes omitted for brevity)"));
+      break;
+    }
+
+    if (oldLines[i] === newLines[j]) {
+      i++;
+      j++;
+    } else {
+      let matchIdx = -1;
+      for (let k = j; k < newLines.length; k++) {
+        if (newLines[k] === oldLines[i]) {
+          matchIdx = k;
+          break;
+        }
+      }
+
+      if (matchIdx !== -1) {
+        for (let k = j; k < matchIdx; k++) {
+          if (printedLines <= 25) {
+            lines.push(pc.green(`+ ${String(newLines[k])}`));
+            printedLines++;
+          }
+        }
+        j = matchIdx;
+      } else {
+        if (oldLines[i] !== undefined) {
+          if (printedLines <= 25) {
+            lines.push(pc.red(`- ${oldLines[i]}`));
+            printedLines++;
+          }
+        }
+        if (newLines[j] !== undefined) {
+          if (printedLines <= 25) {
+            lines.push(pc.green(`+ ${newLines[j]}`));
+            printedLines++;
+          }
+        }
+        i++;
+        j++;
+      }
+    }
+  }
+
+  return lines.join("\n");
 }

@@ -16,6 +16,6 @@
     "lineWidth": 100
   },
   "files": {
-    "ignore": ["node_modules", "coverage"]
+    "ignore": ["node_modules", "coverage", "sandbox", ".forge"]
   }
 }

@@ -131,9 +131,9 @@ describe("detectTestCommand", () => {
     expect(await detectTestCommand(repo)).toBe("pytest");
   });
 
-  it("falls back to bun run test", async () => {
+  it("returns null for an empty directory with no recognizable test setup", async () => {
     const repo = await createFixtureRepo({});
-    expect(await detectTestCommand(repo)).toBe("bun run test");
+    expect(await detectTestCommand(repo)).toBeNull();
   });
 });
 

@@ -1,11 +1,24 @@
 import { spawn as nodeSpawn } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { dirname, extname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { MemoryStore } from "@forge/memory";
 import type { Tool, ToolExecutionContext, ToolResult } from "@forge/types";
 import ts from "typescript";
 import { z } from "zod";
+
+// ─── Shared skip-directory set (C6) ──────────────────────────────────────────
+const SKIP_DIRS = new Set([
+  "node_modules",
+  ".git",
+  "dist",
+  "build",
+  ".next",
+  ".turbo",
+  "coverage",
+  ".cache",
+]);
 
 if (typeof Bun === "undefined") {
   // biome-ignore lint/suspicious/noExplicitAny: polyfill
@@ -73,12 +86,26 @@ export class ToolRegistry {
       return failure(`Unknown tool: ${name}`);
     }
 
+    // A7: Central permission enforcement — check before delegating to tool.
+    // Allow proceeding if the appropriate approval callback is available.
+    const perm = tool.permission;
+    if (perm === "write" && !hasPermission(context, "write") && !context.onApproveFileChange) {
+      return failure(`Write permission is required to use ${name}.`);
+    }
+    if (perm === "execute" && !hasPermission(context, "execute") && !context.onApproveCommand) {
+      return failure(`Execute permission is required to use ${name}.`);
+    }
+
     const parsed = tool.inputSchema.safeParse(input);
     if (!parsed.success) {
       return failure(`Invalid input for ${name}: ${z.prettifyError(parsed.error)}`);
     }
 
-    return tool.execute(parsed.data, context);
+    try {
+      return await tool.execute(parsed.data, context);
+    } catch (err) {
+      return failure(`Tool ${name} threw an error: ${toMessage(err)}`);
+    }
   }
 }
 
@@ -292,18 +319,8 @@ export const listDirectoryTool: RegisteredTool<
           startedAt,
         );
       }
-      const SKIP = new Set([
-        "node_modules",
-        ".git",
-        "dist",
-        "build",
-        ".next",
-        ".turbo",
-        "coverage",
-        ".cache",
-      ]);
       const entries = recursive
-        ? await collectRecursive(absolutePath, absolutePath, 0, 3, SKIP)
+        ? await collectRecursive(absolutePath, absolutePath, 0, 3, SKIP_DIRS)
         : (await readdir(absolutePath, { withFileTypes: true }))
             .map((e) => ({
               name: e.name,
@@ -357,17 +374,34 @@ export const findFilesTool: RegisteredTool<
   async execute({ pattern, excludePatterns, maxResults }, context) {
     const startedAt = performance.now();
     try {
-      const ALWAYS_SKIP = new Set([
-        "node_modules",
-        ".git",
-        "dist",
-        "build",
-        ".next",
-        ".turbo",
-        "coverage",
-        ".cache",
-      ]);
-      const files = await globMatch(context.repositoryPath, pattern, ALWAYS_SKIP, excludePatterns);
+      const repoRoot = context.repositoryPath;
+      let files: string[] = [];
+
+      if (typeof Bun !== "undefined" && typeof Bun.Glob !== "undefined") {
+        // G5: Use Bun.Glob for correct and fast glob matching when available
+        const glob = new Bun.Glob(pattern);
+        const excludeRegexes = excludePatterns.map((p) => {
+          const r = p
+            .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+            .replace(/\*\*/g, ".*")
+            .replace(/\*/g, "[^/]*")
+            .replace(/\?/g, "[^/]");
+          return new RegExp(`^${r}$`);
+        });
+
+        for await (const file of glob.scan({ cwd: repoRoot, onlyFiles: true })) {
+          const normalized = file.replace(/\\/g, "/");
+          const parts = normalized.split("/");
+          if (parts.some((p) => SKIP_DIRS.has(p))) continue;
+          if (excludeRegexes.some((rx) => rx.test(normalized))) continue;
+          files.push(normalized);
+        }
+      } else {
+        // Fallback: manual glob search in non-Bun environments (e.g. Node/Vitest)
+        files = await globMatch(repoRoot, pattern, SKIP_DIRS, excludePatterns);
+      }
+
+      files.sort();
       const limited = files.slice(0, maxResults);
       return success({ files: limited, total: files.length }, startedAt);
     } catch (error) {
@@ -382,14 +416,11 @@ async function globMatch(
   skipDirs: Set<string>,
   extraExclude: string[],
 ): Promise<string[]> {
-  // Convert glob to a regex
   const regexStr = pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&") // escape special chars except * and ?
-    .replace(/\\\*/g, "§STAR§") // temporarily protect escaped stars (none really, but safe)
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*\*/g, "§DSTAR§")
     .replace(/\*/g, "[^/]*")
     .replace(/§DSTAR§/g, ".*")
-    .replace(/§STAR§/g, "\\*")
     .replace(/\?/g, "[^/]");
   const regex = new RegExp(`^${regexStr}$`);
 
@@ -420,7 +451,6 @@ async function globMatch(
   await walk(root);
   return results.sort();
 }
-
 export const listSymbolsTool: RegisteredTool<
   { path: string },
   { path: string; symbols: SymbolEntry[] }
@@ -544,7 +574,7 @@ function extractSymbols(content: string, ext: string): SymbolEntry[] {
 
 export const replaceTextTool: RegisteredTool<
   { path: string; oldText: string; newText: string },
-  { path: string; replacements: 1 }
+  { path: string; replacements: 1; preview?: string }
 > = {
   name: "replace_text",
   description:
@@ -553,7 +583,8 @@ export const replaceTextTool: RegisteredTool<
   inputSchema: replaceTextInputSchema,
   async execute({ path, oldText, newText }, context) {
     const startedAt = performance.now();
-    if (!context.allowedPermissions?.includes("write")) {
+    // A8: Use shared hasPermission() helper instead of inline check, allowing override if onApproveFileChange is present
+    if (!hasPermission(context, "write") && !context.onApproveFileChange) {
       return failure<{ path: string; replacements: 1 }>(
         "Write permission is required to use replace_text.",
         startedAt,
@@ -576,11 +607,11 @@ export const replaceTextTool: RegisteredTool<
         );
       }
 
-      const newContent = content.replace(oldText, newText);
+      const newContent = content.split(oldText).join(newText);
       if (context.onApproveFileChange) {
         const approved = await context.onApproveFileChange(path, newContent, content);
         if (!approved) {
-          return failure<{ path: string; replacements: 1 }>(
+          return failure<{ path: string; replacements: 1; preview: string }>(
             "File replacement request was rejected by the user.",
             startedAt,
           );
@@ -588,16 +619,32 @@ export const replaceTextTool: RegisteredTool<
       }
 
       await writeFile(absolutePath, newContent, "utf8");
-      return success({ path: absolutePath, replacements: 1 as const }, startedAt);
+
+      // Build a ±3-line context snippet around the changed region so the model
+      // can self-verify the edit without a follow-up read_file call.
+      const newLines = newContent.split("\n");
+      const changeStart = newContent.indexOf(newText);
+      const linesBefore = newContent.slice(0, changeStart).split("\n").length - 1;
+      const contextFrom = Math.max(0, linesBefore - 3);
+      const contextTo = Math.min(newLines.length, linesBefore + newText.split("\n").length + 3);
+      const snippet = newLines
+        .slice(contextFrom, contextTo)
+        .map((l, i) => `${String(contextFrom + i + 1).padStart(4)} │ ${l}`)
+        .join("\n");
+
+      return success({ path: absolutePath, replacements: 1 as const, preview: snippet }, startedAt);
     } catch (error) {
-      return failure<{ path: string; replacements: 1 }>(toMessage(error), startedAt);
+      return failure<{ path: string; replacements: 1; preview: string }>(
+        toMessage(error),
+        startedAt,
+      );
     }
   },
 };
 
 export const writeFileTool: RegisteredTool<
   { path: string; content: string; overwrite: boolean },
-  { path: string; bytesWritten: number }
+  { path: string; bytesWritten: number; preview?: string }
 > = {
   name: "write_file",
   description:
@@ -606,7 +653,7 @@ export const writeFileTool: RegisteredTool<
   inputSchema: writeFileInputSchema,
   async execute({ path, content, overwrite }, context) {
     const startedAt = performance.now();
-    if (!hasPermission(context, "write"))
+    if (!hasPermission(context, "write") && !context.onApproveFileChange)
       return failure("Write permission is required to use write_file.", startedAt);
     try {
       const absolutePath = resolveRepositoryPath(context.repositoryPath, path);
@@ -629,7 +676,16 @@ export const writeFileTool: RegisteredTool<
       // Auto-create parent directories
       await mkdir(dirname(absolutePath), { recursive: true });
       await writeFile(absolutePath, content, "utf8");
-      return success({ path: absolutePath, bytesWritten: Buffer.byteLength(content) }, startedAt);
+      // Return a preview of the first 20 lines so the model can confirm the
+      // file looks correct without a follow-up read_file call.
+      const previewLines = content.split("\n").slice(0, 20);
+      const preview =
+        previewLines.map((l, i) => `${String(i + 1).padStart(4)} │ ${l}`).join("\n") +
+        (content.split("\n").length > 20 ? "\n     … (truncated)" : "");
+      return success(
+        { path: absolutePath, bytesWritten: Buffer.byteLength(content), preview },
+        startedAt,
+      );
     } catch (error) {
       return failure(toMessage(error), startedAt);
     }
@@ -644,7 +700,7 @@ export const applyPatchTool: RegisteredTool<{ patch: string }, ApplyPatchResult>
   inputSchema: applyPatchInputSchema,
   async execute({ patch }, context) {
     const startedAt = performance.now();
-    if (!hasPermission(context, "write"))
+    if (!hasPermission(context, "write") && !context.onApproveFileChange)
       return failure("Write permission is required to use apply_patch.", startedAt);
     try {
       const result = await applyUnifiedDiff(patch, context.repositoryPath, context);
@@ -690,20 +746,23 @@ async function applyUnifiedDiff(
       const originalContent = await readFile(absolutePath, "utf8").catch(() => "");
       const contentLines = originalContent.split("\n");
 
-      // Parse and apply hunks
+      // Parse and apply hunks into contentLines (in memory only for now)
       const hunks = parseHunks(lines);
       let offset = 0;
+      let fileHunksApplied = 0;
+      let fileHunksRejected = 0;
       for (const hunk of hunks) {
         const applied = applyHunk(contentLines, hunk, offset);
         if (applied.success) {
           offset += applied.offset;
-          result.hunksApplied++;
+          fileHunksApplied++;
         } else {
-          result.hunksRejected++;
+          fileHunksRejected++;
         }
       }
 
       const content = contentLines.join("\n");
+      // E6: Ask for approval BEFORE incrementing hunksApplied
       if (context?.onApproveFileChange) {
         const approved = await context.onApproveFileChange(
           targetPath,
@@ -711,11 +770,15 @@ async function applyUnifiedDiff(
           originalContent || undefined,
         );
         if (!approved) {
+          // User rejected — count all attempted hunks as rejected, none as applied
           result.hunksRejected += hunks.length;
           continue;
         }
       }
 
+      // Approval granted (or no approval callback) — commit counts and write
+      result.hunksApplied += fileHunksApplied;
+      result.hunksRejected += fileHunksRejected;
       await mkdir(dirname(absolutePath), { recursive: true });
       await writeFile(absolutePath, content, "utf8");
       result.filesPatched.push(rel.replace(/\\/g, "/"));
@@ -886,8 +949,15 @@ export const searchCodeTool: RegisteredTool<
         }
       }
 
-      // If ripgrep not available, fall back to plain text mode
-      if (raw.exitCode !== 0 && matches.length === 0 && raw.stderr.includes("not found")) {
+      // If ripgrep not available (any OS), fall back to plain text mode
+      const rgMissing =
+        raw.exitCode !== 0 &&
+        matches.length === 0 &&
+        (raw.stderr.includes("not found") ||
+          raw.stderr.includes("not recognized") ||
+          raw.stderr.includes("ENOENT") ||
+          raw.stderr.includes("No such file"));
+      if (rgMissing) {
         // Fallback: manual text search
         const fallbackMatches = await textSearch(
           context.repositoryPath,
@@ -943,21 +1013,26 @@ async function textSearch(
   maxResults: number,
 ): Promise<SearchMatch[]> {
   const results: SearchMatch[] = [];
-  const skip = new Set(["node_modules", ".git", "dist", "build"]);
+  // G4: Use shared SKIP_DIRS set
   const rx = isRegex
     ? new RegExp(query, caseSensitive ? "g" : "gi")
     : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), caseSensitive ? "g" : "gi");
+
+  const MAX_FILE_SIZE = 500 * 1024; // 500 KB
 
   async function walk(dir: string) {
     if (results.length >= maxResults) return;
     const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
     for (const e of entries) {
       if (results.length >= maxResults) break;
-      if (skip.has(e.name)) continue;
+      if (SKIP_DIRS.has(e.name)) continue;
       const full = join(dir, e.name);
       if (e.isDirectory()) {
         await walk(full);
       } else if (e.isFile()) {
+        // G4: Skip files larger than 500 KB to avoid loading huge files
+        const fileInfo = await stat(full).catch(() => null);
+        if (!fileInfo || fileInfo.size > MAX_FILE_SIZE) continue;
         const text = await readFile(full, "utf8").catch(() => null);
         if (!text) continue;
         const lines = text.split("\n");
@@ -1140,13 +1215,22 @@ export const forgetFactTool: RegisteredTool<{ key: string }, Record<string, stri
  * Convert a raw ToolResult into a compact, human-readable string for LLM messages.
  * Prevents the LLM from drowning in raw JSON or massive stdout blobs.
  */
-export function formatToolResult(toolName: string, result: ToolResult): string {
+export function formatToolResult(
+  toolName: string,
+  result: ToolResult,
+  repositoryPath?: string,
+): string {
   if (!result.success) {
     return `❌ ${toolName} failed: ${result.error ?? "Unknown error"}`;
   }
 
   const data = result.data as Record<string, unknown> | undefined;
   if (!data) return `✅ ${toolName} succeeded.`;
+
+  const getDisplayPath = (p: string) => {
+    if (!p) return "";
+    return repositoryPath ? relative(repositoryPath, p) || "." : relative("", p) || p;
+  };
 
   switch (toolName) {
     case "remember_fact": {
@@ -1178,7 +1262,7 @@ export function formatToolResult(toolName: string, result: ToolResult): string {
         d.fromLine === 1 && d.toLine === d.totalLines
           ? `${d.totalLines} lines`
           : `lines ${d.fromLine}–${d.toLine} of ${d.totalLines}`;
-      return `📄 ${relative("", d.path) || d.path} (${rangeNote}):\n\`\`\`\n${d.content}\n\`\`\``;
+      return `📄 ${getDisplayPath(d.path)} (${rangeNote}):\n\`\`\`\n${d.content}\n\`\`\``;
     }
 
     case "list_directory": {
@@ -1186,7 +1270,7 @@ export function formatToolResult(toolName: string, result: ToolResult): string {
       const dirs = entries.filter((e) => e.type === "directory");
       const files = entries.filter((e) => e.type === "file");
       const lines = [
-        `📁 ${data.path} — ${dirs.length} dirs, ${files.length} files:`,
+        `📁 ${getDisplayPath(String(data.path))} — ${dirs.length} dirs, ${files.length} files:`,
         ...entries.map(
           (e) => `  ${e.type === "directory" ? "📂" : "📄"} ${e.relativePath ?? e.name}`,
         ),
@@ -1203,11 +1287,12 @@ export function formatToolResult(toolName: string, result: ToolResult): string {
 
     case "list_symbols": {
       const symbols = data.symbols as SymbolEntry[];
-      if (symbols.length === 0) return `📋 No symbols found in ${data.path}.`;
+      if (symbols.length === 0)
+        return `📋 No symbols found in ${getDisplayPath(String(data.path))}.`;
       const lines = symbols.map(
         (s) => `  ${s.line.toString().padStart(4)} │ [${s.kind.padEnd(9)}] ${s.name}`,
       );
-      return `📋 Symbols in ${data.path}:\n${lines.join("\n")}`;
+      return `📋 Symbols in ${getDisplayPath(String(data.path))}:\n${lines.join("\n")}`;
     }
 
     case "search_code": {
@@ -1229,16 +1314,21 @@ export function formatToolResult(toolName: string, result: ToolResult): string {
     }
 
     case "write_file": {
-      return `✅ Wrote ${data.bytesWritten} bytes to ${data.path}`;
+      const preview = data.preview as string | undefined;
+      const base = `✅ Wrote ${data.bytesWritten} bytes to ${getDisplayPath(String(data.path))}`;
+      return preview ? `${base}\n\`\`\`\n${preview}\n\`\`\`` : base;
     }
 
     case "replace_text": {
-      return `✅ Applied 1 replacement in ${data.path}`;
+      const preview = data.preview as string | undefined;
+      const base = `✅ Applied 1 replacement in ${getDisplayPath(String(data.path))}`;
+      return preview ? `${base} — result around edit:\n\`\`\`\n${preview}\n\`\`\`` : base;
     }
 
     case "apply_patch": {
       const r = data as unknown as ApplyPatchResult;
-      return `✅ Patch applied: ${r.filesPatched.length} file(s) patched, ${r.hunksApplied} hunk(s) applied${r.hunksRejected > 0 ? `, ${r.hunksRejected} rejected` : ""}.\nFiles: ${r.filesPatched.join(", ")}`;
+      const files = r.filesPatched.map((f) => getDisplayPath(f));
+      return `✅ Patch applied: ${r.filesPatched.length} file(s) patched, ${r.hunksApplied} hunk(s) applied${r.hunksRejected > 0 ? `, ${r.hunksRejected} rejected` : ""}.\nFiles: ${files.join(", ")}`;
     }
 
     case "run_command":
@@ -1279,7 +1369,27 @@ export interface CommandResult {
 
 function resolveRepositoryPath(repositoryPath: string, requestedPath: string): string {
   const root = resolve(repositoryPath);
-  const candidate = resolve(root, requestedPath);
+  const repoName = basename(root);
+
+  let normalizedPath = requestedPath;
+  const normalizedLower = requestedPath.replace(/\\/g, "/").toLowerCase();
+
+  if (
+    repoName &&
+    (normalizedLower.startsWith(`${repoName.toLowerCase()}/`) ||
+      normalizedLower === repoName.toLowerCase())
+  ) {
+    // If the repository name prefix was supplied (e.g. "sandbox/index.html"),
+    // check if there is an actual folder with that name inside the workspace.
+    // If not, it's a doubled path from the model and we strip the prefix.
+    const internalDir = join(root, repoName);
+    const hasInternalDir = existsSync(internalDir) && statSync(internalDir).isDirectory();
+    if (!hasInternalDir) {
+      normalizedPath = requestedPath.slice(repoName.length + 1);
+    }
+  }
+
+  const candidate = resolve(root, normalizedPath);
   const relativePath = relative(root, candidate);
   if (relativePath === "" || (!relativePath.startsWith(`..${sep}`) && relativePath !== "..")) {
     return candidate;
@@ -1305,29 +1415,35 @@ async function runProcess(
   command: string[],
   context: ToolExecutionContext,
 ): Promise<CommandResult> {
-  const process = Bun.spawn(command, {
+  const parentDir = dirname(context.repositoryPath);
+  const proc = Bun.spawn(command, {
     cwd: context.repositoryPath,
+    env: {
+      ...process.env,
+      GIT_CEILING_DIRECTORIES: parentDir,
+    },
     stdout: "pipe",
     stderr: "pipe",
   });
   let terminationReason: "timeout" | "cancelled" | undefined;
   const cancel = () => {
     terminationReason = "cancelled";
-    process.kill();
+    proc.kill();
   };
   const timeoutMs = context.commandTimeoutMs ?? 60_000;
   const timeout = setTimeout(() => {
     terminationReason = "timeout";
-    process.kill();
+    proc.kill();
   }, timeoutMs);
   context.signal?.addEventListener("abort", cancel, { once: true });
   const [exitCode, stdout, stderr] = await Promise.all([
-    process.exited,
-    new Response(process.stdout).text(),
-    new Response(process.stderr).text(),
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
   ]);
   clearTimeout(timeout);
   context.signal?.removeEventListener("abort", cancel);
+  // E5: Use dynamic timeout value instead of hardcoded 60 seconds
   if (terminationReason === "timeout")
     throw new Error(`Command timed out after ${timeoutMs / 1000} seconds.`);
   if (terminationReason === "cancelled") throw new Error("Command was cancelled.");

@@ -46,4 +46,14 @@ describe("RepositoryContextBuilder", () => {
     expect(result.text).not.toContain("node_modules");
     expect(result.text).not.toContain(".git/");
   });
+
+  it("buildStructured() includes project guidelines from FORGE.md", async () => {
+    const root = await createTestRepository();
+    await writeFile(join(root, "FORGE.md"), "# Guidelines\nDo not use callbacks.\n", "utf8");
+    const builder = new RepositoryContextBuilder();
+    const result = await builder.buildStructured(root);
+
+    expect(result.text).toContain("Project Guidelines (from FORGE.md)");
+    expect(result.text).toContain("Do not use callbacks.");
+  });
 });

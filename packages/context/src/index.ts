@@ -1,12 +1,12 @@
 import { readFile, readdir, stat } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { detectTestCommand } from "@forge/runtime";
 
 export interface RepositoryContext {
   /** Full context string to inject into the system prompt */
   text: string;
-  /** Detected test command for verification */
-  testCommand: string;
+  /** Detected test command for verification — null when no test setup is found */
+  testCommand: string | null;
   /** Git branch name, if in a git repo */
   gitBranch?: string;
 }
@@ -40,8 +40,9 @@ export class RepositoryContextBuilder {
 
     // ── Detected test command ────────────────────────────────────────────────
     const testCommand = await detectTestCommand(root);
-    sections.push(`## Test Command\n${testCommand}`);
-
+    if (testCommand) {
+      sections.push(`## Test Command\n${testCommand}`);
+    }
     // ── Package.json scripts ─────────────────────────────────────────────────
     const pkgJson = await readFile(join(root, "package.json"), "utf8").catch(() => null);
     if (pkgJson) {
@@ -72,7 +73,7 @@ export class RepositoryContextBuilder {
       "coverage",
       ".cache",
     ]);
-    const treeLines = await buildTree(root, root, 0, 2, SKIP);
+    const treeLines = await buildTree(root, root, 0, 5, SKIP);
     if (treeLines.length > 0) {
       sections.push(`## Repository Structure\n${treeLines.join("\n")}`);
     }
@@ -81,6 +82,17 @@ export class RepositoryContextBuilder {
     const readme = await readFile(join(root, "README.md"), "utf8").catch(() => null);
     if (readme) {
       sections.push(`## README (excerpt)\n${readme.slice(0, 2000)}`);
+    }
+
+    // ── FORGE.md / CLAUDE.md guidelines ──────────────────────────────────────
+    let guidelines = await readFile(join(root, "FORGE.md"), "utf8").catch(() => null);
+    let guidelinesName = "FORGE.md";
+    if (!guidelines) {
+      guidelines = await readFile(join(root, "CLAUDE.md"), "utf8").catch(() => null);
+      guidelinesName = "CLAUDE.md";
+    }
+    if (guidelines) {
+      sections.push(`## Project Guidelines (from ${guidelinesName})\n${guidelines}`);
     }
 
     // ── tsconfig / pyproject / Cargo.toml snippet ────────────────────────────
@@ -134,8 +146,15 @@ async function buildTree(
 async function runGit(cwd: string, args: string[]): Promise<string> {
   try {
     const { spawn } = await import("node:child_process");
+    const parentDir = dirname(cwd);
     return await new Promise<string>((resolve) => {
-      const proc = spawn("git", args, { cwd, env: process.env });
+      const proc = spawn("git", args, {
+        cwd,
+        env: {
+          ...process.env,
+          GIT_CEILING_DIRECTORIES: parentDir,
+        },
+      });
       let out = "";
       proc.stdout?.on("data", (chunk: Buffer) => {
         out += chunk.toString();

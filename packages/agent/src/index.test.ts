@@ -59,8 +59,6 @@ describe("CodingAgent", () => {
 
     expect(result).toContain("Completed successfully.");
     expect(events).toEqual([
-      "plan.started",
-      "plan.finished",
       "model.started",
       "model.finished",
       "tool.started",
@@ -234,7 +232,7 @@ describe("CodingAgent", () => {
     );
 
     expect(result).toContain("Resumed final answer");
-    // Should not emit plan events when resuming from history
+    // plan events no longer exist in the type system
     expect(events).not.toContain("plan.started");
   });
 
@@ -345,6 +343,43 @@ describe("CodingAgent", () => {
       expect(pruned[2]?.content).toContain("... [output truncated for brevity]");
       expect(pruned[2]?.content).toContain("A".repeat(200));
       expect(pruned[2]?.content?.length).toBeLessThan(300);
+    });
+  });
+
+  describe("compactHistory", () => {
+    it("compacts older assistant-tool message blocks", () => {
+      const tools = new ToolRegistry();
+      const provider = new ScriptedProvider([]);
+      const agent = new CodingAgent(provider, tools);
+
+      agent.messages = [
+        { role: "system", content: "system prompt" },
+        { role: "user", content: "initial prompt" },
+        {
+          role: "assistant",
+          content: "thinking...",
+          toolCalls: [{ id: "call-1", name: "read_file", arguments: { path: "test.txt" } }],
+        },
+        { role: "tool", toolCallId: "call-1", content: "file content" },
+        {
+          role: "assistant",
+          content: "thinking...",
+          toolCalls: [{ id: "call-2", name: "read_file", arguments: { path: "test.txt" } }],
+        },
+        { role: "tool", toolCallId: "call-2", content: "file content" },
+        {
+          role: "assistant",
+          content: "thinking...",
+          toolCalls: [{ id: "call-3", name: "read_file", arguments: { path: "test.txt" } }],
+        },
+        { role: "tool", toolCallId: "call-3", content: "file content" },
+        { role: "assistant", content: "done!" },
+      ];
+
+      const res = agent.compactHistory(2);
+      expect(res.afterCount).toBeLessThan(res.beforeCount);
+      expect(agent.messages[2]?.role).toBe("user");
+      expect(agent.messages[2]?.content).toContain("CONTEXT COMPACTED");
     });
   });
 });

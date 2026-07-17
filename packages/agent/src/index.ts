@@ -5,21 +5,29 @@ import { formatToolResult } from "@forge/tools";
 import type { ModelMessage, ModelProvider, ToolExecutionContext } from "@forge/types";
 
 export type AgentEvent =
-  | { type: "plan.started" }
-  | { type: "plan.finished"; plan: string }
   | { type: "model.started"; step: number }
   | { type: "model.token"; step: number; token: string }
   | { type: "model.finished"; step: number; toolCallCount: number }
-  | { type: "tool.started"; step: number; toolName: string; args: Record<string, unknown> }
-  | { type: "tool.finished"; step: number; toolName: string; success: boolean };
+  | {
+      type: "tool.started";
+      step: number;
+      toolCallId: string;
+      toolName: string;
+      args: Record<string, unknown>;
+    }
+  | { type: "tool.finished"; step: number; toolCallId: string; toolName: string; success: boolean };
 
 export interface AgentRunOptions {
   maxSteps?: number;
   repositoryContext?: string;
   verifyCommand?: string;
   history?: ModelMessage[];
+  /** When true, appends the new user message directly to history (for REPL multi-turn chat).
+   *  When false/undefined, uses a "Continuing the task" prefix (for --session resume). */
+  continueChat?: boolean;
   onEvent?: (event: AgentEvent) => void;
-  enablePlanning?: boolean;
+  onStepLimitReached?: () => Promise<boolean>;
+  pricing?: { inputPerMillion: number; outputPerMillion: number };
 }
 
 /** Approximate token count — 1 token ≈ 4 chars. */
@@ -54,10 +62,11 @@ function compressHistory(messages: ModelMessage[], keepSystemUser: number): Mode
 
   if (compressUpTo === 0) return messages;
 
-  // Use role "system" so it never creates an invalid user→tool or user→assistant sequence
+  // Use role "user" (not "system") — mid-conversation system messages are invalid per OpenAI/Anthropic API spec.
+  // Claude Code uses the same [CONTEXT COMPACTED] user-message convention.
   const compressed: ModelMessage = {
-    role: "system",
-    content: `[Context compacted: ${compressUpTo} earlier messages summarised to save context. The agent has already made progress on the task. Continue from the current state.]`,
+    role: "user",
+    content: `[CONTEXT COMPACTED: ${compressUpTo} earlier messages summarised to save context. The agent has already made progress on the task. Continue from the current state.]`,
   };
 
   return [...header, compressed, ...tail.slice(compressUpTo)];
@@ -128,21 +137,24 @@ export function pruneHistory(messages: ModelMessage[]): ModelMessage[] {
         }
 
         if (callDef.name === "run_command" && thresholdIndex !== -1 && i <= thresholdIndex + 5) {
-          if (msg.content?.startsWith("✅ run_command")) {
-            const match = msg.content.match(/^✅ run_command(.*?):\n```\n([\s\S]*?)\n```$/);
-            if (match) {
-              const exitNote = match[1] ?? "";
-              const stdout = match[2] ?? "";
-              if (stdout.length > 200) {
-                const truncatedStdout = `${stdout.slice(0, 200)}\n... [output truncated for brevity]`;
-                const prunedMessage: ModelMessage = {
-                  role: "tool",
-                  toolCallId: msg.toolCallId,
-                  content: `✅ run_command${exitNote}:\n\`\`\`\n${truncatedStdout}\n\`\`\``,
-                };
-                result.push(prunedMessage);
-                continue;
-              }
+          // Truncate long run_command outputs in older history to keep context manageable.
+          // We look for the formatted output markers rather than parsing presentation strings.
+          const content = msg.content ?? "";
+          // Find the code fence block and truncate it if the stdout is long
+          const fenceStart = content.indexOf("```\n");
+          const fenceEnd = content.lastIndexOf("\n```");
+          if (fenceStart !== -1 && fenceEnd !== -1 && fenceEnd > fenceStart) {
+            const prefix = content.slice(0, fenceStart + 4);
+            const stdout = content.slice(fenceStart + 4, fenceEnd);
+            if (stdout.length > 200) {
+              const truncatedStdout = `${stdout.slice(0, 200)}\n... [output truncated for brevity]`;
+              const prunedMessage: ModelMessage = {
+                role: "tool",
+                toolCallId: msg.toolCallId,
+                content: `${prefix}${truncatedStdout}\n\`\`\``,
+              };
+              result.push(prunedMessage);
+              continue;
             }
           }
         }
@@ -155,81 +167,76 @@ export function pruneHistory(messages: ModelMessage[]): ModelMessage[] {
   return result;
 }
 
-const SYSTEM_PROMPT = `You are Forge, an expert autonomous coding agent. You think carefully, act deliberately, and write clean, correct code.
+const SYSTEM_PROMPT = `You are Forge, an expert autonomous coding agent. You think step-by-step and write clean, correct code.
 
-## Strategy — follow this order for every task
+## Strategy
 
-1. **Orient** — use \`git_status\`, \`list_directory\` (or \`find_files\`) to understand the codebase shape.
-2. **Locate** — use \`search_code\` to find the relevant files and symbols. Never guess file paths.
-3. **Read** — use \`read_file\` with \`startLine\`/\`endLine\` to read just what you need. Use \`list_symbols\` to get a file's outline first.
-4. **Plan** — reason step-by-step *before* editing. Write a short plan in your response before calling write tools.
-5. **Edit** — prefer \`replace_text\` for targeted changes. Use \`write_file\` (overwrite=true) only for full rewrites. Use \`apply_patch\` for multi-hunk diffs.
-6. **Verify** — after editing, run the project's test/build command to confirm correctness. If it fails, read the error and fix it.
-7. **Commit** — if the user asked for a commit, use \`git_commit\` with a clear conventional-commit message.
-8. **Report** — when done, summarise: what files changed, what was added/removed, and the test outcome.
+1. **Orient** — for *existing* codebases, use \`list_directory\` or \`find_files\` to understand structure. Skip if creating from scratch.
+2. **Locate** — use \`search_code\` to find relevant files. Never guess file paths.
+3. **Read** — use \`read_file\` with \`startLine\`/\`endLine\` to read only what you need.
+4. **Plan** — reason in 1–2 sentences before editing. No multi-point prose plans.
+5. **Edit** — prefer \`replace_text\` for targeted changes, \`write_file\` for new files or full rewrites, \`apply_patch\` for multi-hunk diffs. For simple tasks (HTML page, single script) keep it in one file.
+6. **Verify** — run the test/build command from the repo context ONLY if one exists. Never invent test commands or verification scripts.
+7. **Report** — briefly summarise what changed.
 
-## Hard rules
+## Critical rules
 
-- **Never invent file paths.** Always use \`search_code\` or \`find_files\` to confirm a file exists before reading or editing it.
-- **Never repeat the full file contents** in your response — reference line numbers instead.
-- **No scratchpad files.** Do not create temporary files (e.g. \`temp.txt\`) to test code or store intermediate thoughts unless explicitly requested by the user. Do your thinking in the chat response.
-- **Batch independent reads.** You may call multiple tools in a single step when the results do not depend on each other (e.g. reading several files, running search + git_status simultaneously). They execute in parallel.
-- **No deferred tool execution.** If you want to use a tool, you MUST include the tool call in your current assistant message. Never output text saying "I will run X" or "Let me edit Y" in a future step without actually generating the tool call in this response. If you output text without tool calls, the agent loop immediately terminates.
-- **If a test fails**, do not give up. Read the failure, locate the relevant code, and fix it. You get multiple steps.
-- **Write permission is required** for \`write_file\`, \`replace_text\`, \`apply_patch\`, and \`git_commit\`.
-- **If you are unsure** about a design decision, state the trade-offs and pick the simpler option.
-- **GUI / Blocking commands**: If you need to launch a GUI window or run a long-running process (like Pygame or a local web server) that does not exit immediately, you MUST run it in the background to prevent a command timeout.
-  - On Windows (cmd): Use \`start\`, e.g. \`start python calculator.py\`
-  - On Unix: Use \`&\` at the end, e.g. \`python calculator.py &\`
+- **Tool calls are mandatory.** Every assistant message that continues work MUST include tool calls. Text without tool calls terminates the loop. Never say "I will do X next" without including the tool call.
+- **Write tools confirm success.** \`write_file\` and \`replace_text\` return a preview of the result. Do NOT \`read_file\` after writing — the preview is your confirmation. Do NOT run shell commands (Test-Path, cat, Get-Content) to verify files you just wrote.
+- **Don't re-read files in context.** If you already read a file in this conversation and it hasn't been modified since, use the content from your history.
+- **Keep responses brief.** 1–2 sentences before tool calls. Let the tools speak.
+- **Never invent file paths.** Use \`search_code\` or \`find_files\` to confirm paths.
+- **Batch independent calls.** Multiple non-dependent tool calls execute in parallel.
+- **GUI / blocking commands**: Launch with \`start\` (Windows) or \`&\` (Unix) to avoid timeout.`;
 
-## Tool quick-reference
-
-| Tool | When to use |
-|---|---|
-| \`find_files\` | Discover files by glob pattern — faster than recursive listing |
-| \`search_code\` | Find where a symbol, string, or pattern is used |
-| \`list_symbols\` | Get the outline (functions, classes) of a file without reading it all |
-| \`read_file\` | Read a file or a specific line range |
-| \`replace_text\` | Targeted single-block edits (preferred) |
-| \`apply_patch\` | Multi-hunk or multi-file edits via unified diff |
-| \`write_file\` | Create new files or full overwrites |
-| \`run_command\` | Build, test, lint, or any shell command |
-| \`git_status\` | Check what has changed |
-| \`git_diff\` | See the exact diff of current changes |
-| \`git_log\` | Review recent commits for context |
-| \`git_blame\` | Find who changed a specific line and when |
-| \`git_commit\` | Stage and commit specific files |
-
-Start by thinking through the task, then act.`;
+function getShellContext(): string {
+  const isWin = process.platform === "win32";
+  if (isWin) {
+    return "\n\n## Shell Environment\n- **OS**: Windows\n- **Shell**: PowerShell (powershell.exe)\n- **Rule**: When executing commands with `run_command`, you MUST use PowerShell syntax. Do NOT use bash syntax like '&&', 'ls -la', 'export', or '/'. Instead, use ';', 'Get-ChildItem', '$env:', and '\\' for paths.";
+  }
+  return "\n\n## Shell Environment\n- **OS**: Unix/macOS\n- **Shell**: POSIX shell (/bin/sh)\n- **Rule**: When executing commands with `run_command`, you MUST use standard POSIX shell syntax.";
+}
 
 export class CodingAgent {
   public messages: ModelMessage[] = [];
+  public totalInputTokens = 0;
+  public totalOutputTokens = 0;
 
   constructor(
-    private readonly model: ModelProvider,
+    public readonly model: ModelProvider,
     private readonly tools: ToolRegistry,
   ) {}
+
+  public compactHistory(keepSystemUser = 2): { beforeCount: number; afterCount: number } {
+    const beforeCount = this.messages.length;
+    const compressed = compressHistory(this.messages, keepSystemUser);
+    this.messages.splice(0, this.messages.length, ...compressed);
+    return { beforeCount, afterCount: this.messages.length };
+  }
 
   async run(
     task: string,
     context: ToolExecutionContext,
     options: AgentRunOptions = {},
   ): Promise<string> {
-    const maxSteps = options.maxSteps ?? 20;
+    let maxSteps = options.maxSteps ?? 60;
     let messages: ModelMessage[] = [];
     this.messages = messages;
 
     if (options.history && options.history.length > 0) {
-      // Resume: load history, inject a continuation message
+      // Resume existing conversation — push history then new user message
       messages.push(...options.history);
-      messages.push({
-        role: "user",
-        content: `Continuing the task. Additional instructions: ${task}`,
-      });
+      if (options.continueChat) {
+        // REPL chat mode: just append the user's new message directly
+        messages.push({ role: "user", content: task });
+      } else {
+        // One-shot --session resume: add explicit continuation prefix
+        messages.push({
+          role: "user",
+          content: `Continuing the task. Additional instructions: ${task}`,
+        });
+      }
     } else {
-      // Fresh start — generate a real plan using the model if requested
-      options.onEvent?.({ type: "plan.started" });
-
       const facts = await MemoryStore.load(context.repositoryPath);
       let memoryNote = "";
       if (Object.keys(facts).length > 0) {
@@ -238,55 +245,18 @@ export class CodingAgent {
           .join("\n")}`;
       }
 
-      let generatedPlan = `Task: ${task}\n\nRepository context:\n${options.repositoryContext ?? "(not provided)"}`;
-
-      if (options.enablePlanning) {
-        try {
-          const plannerResponse = await this.model.complete({
-            messages: [
-              {
-                role: "system",
-                content:
-                  "You are Forge's planning assistant. Generate a concise, step-by-step implementation plan for the given task. List what files to create or modify, any command executions needed, and how to verify the work. Keep it clear and action-oriented. Never output tool calls here, output only raw text.",
-              },
-              {
-                role: "user",
-                content: `Task: ${task}\n\nRepository context:\n${options.repositoryContext ?? "(not provided)"}`,
-              },
-            ],
-            tools: [],
-            onToken: (token) => {
-              // Stream planner tokens so the terminal shows progress during planning
-              options.onEvent?.({ type: "model.token", step: 0, token });
-            },
-          });
-          if (plannerResponse.content) {
-            generatedPlan = plannerResponse.content;
-          }
-        } catch (error) {
-          // Fallback to basic planNote if planning fails
-        }
-      }
-
-      options.onEvent?.({ type: "plan.finished", plan: generatedPlan });
-
-      // Only label it as an "Implementation Plan" when planning was actually enabled
-      // and produced a real plan (not just the fallback task description).
-      const planSection = options.enablePlanning
-        ? `Task: ${task}\n\nImplementation Plan:\n${generatedPlan}`
-        : `Task: ${task}`;
-      const planNote = `${planSection}${memoryNote}\n\nRepository Context:\n${options.repositoryContext ?? "(not provided)"}`;
+      const userContent = `Task: ${task}${memoryNote}\n\nRepository Context:\n${options.repositoryContext ?? "(not provided)"}`;
 
       messages.push(
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: SYSTEM_PROMPT + getShellContext() },
         {
           role: "user",
-          content: `${planNote}\n\nPlease begin executing the plan.`,
+          content: userContent,
         },
       );
     }
 
-    const verifyCommand =
+    const verifyCommand: string | null =
       options.verifyCommand ?? (await detectTestCommand(context.repositoryPath));
     const changedTools = new Set(["write_file", "replace_text", "apply_patch", "git_commit"]);
     let changedFiles = false;
@@ -294,10 +264,28 @@ export class CodingAgent {
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
 
+    // Loop prevention safeguards
+    const toolCallCounts = new Map<string, number>();
+    let toolCallsSinceLastEdit = 0;
+
     // Header messages count (system + first user) — don't compress these
     const headerCount = messages.length;
 
-    for (let step = 0; step < maxSteps; step += 1) {
+    let step = 0;
+    while (true) {
+      if (step >= maxSteps) {
+        if (options.onStepLimitReached) {
+          const shouldContinue = await options.onStepLimitReached();
+          if (shouldContinue) {
+            maxSteps += options.maxSteps ?? 60;
+          } else {
+            throw new Error(`Agent exceeded its ${maxSteps}-step limit.`);
+          }
+        } else {
+          throw new Error(`Agent exceeded its ${maxSteps}-step limit.`);
+        }
+      }
+
       context.signal?.throwIfAborted();
 
       // Prune history to optimize context size
@@ -305,7 +293,15 @@ export class CodingAgent {
       this.messages = messages;
 
       // Context window management: estimate tokens and compress if needed
-      const historyText = messages.map((m) => m.content ?? "").join("");
+      const historyText = messages
+        .map((m) => {
+          let text = m.content ?? "";
+          if (m.toolCalls) {
+            text += JSON.stringify(m.toolCalls);
+          }
+          return text;
+        })
+        .join("");
       const estimatedTokens = estimateTokens(historyText);
       if (estimatedTokens > 60_000) {
         const compressed = compressHistory(messages, headerCount);
@@ -325,6 +321,8 @@ export class CodingAgent {
       if (response.usage) {
         totalInputTokens += response.usage.inputTokens;
         totalOutputTokens += response.usage.outputTokens;
+        this.totalInputTokens += response.usage.inputTokens;
+        this.totalOutputTokens += response.usage.outputTokens;
       }
 
       options.onEvent?.({
@@ -346,18 +344,31 @@ export class CodingAgent {
         // a deliberate info-only response (e.g. answering a question).
         const content = response.content ?? "";
         const hasPriorToolCalls = messages.some((m) => m.role === "tool");
+        const isDeferredAction =
+          /\b(let me|i will|i'll|i’ll|i need to|let's|let’s|going to|about to|running|checking|trying|rewriting|updating|adding|modifying|replacing|fixing)\b/i.test(
+            content,
+          );
+
+        const isQuestion =
+          /\?\s*$/i.test(content) ||
+          /\b(could you|would you|should i|can you|please clarify|please specify|please let me know)\b/i.test(
+            content,
+          );
+
         const looksLikeInfoResponse =
-          content.length < 200 || // very short responses are probably answers or errors
+          (content.length < 200 && !isDeferredAction) || // very short responses are probably answers or errors
           /\b(error|fail|denied|cannot|unable|permission|not found|doesn't exist)\b/i.test(
             content,
           ) ||
           /\b(here is|here's|this is|the answer|in summary|to answer)\b/i.test(content);
 
         const shouldPushBack =
-          step === 0 && !hasPriorToolCalls && !changedFiles && !looksLikeInfoResponse;
+          ((step === 0 && !hasPriorToolCalls && !changedFiles && !looksLikeInfoResponse) ||
+            (isDeferredAction && !looksLikeInfoResponse)) &&
+          !isQuestion;
 
         if (shouldPushBack && step < maxSteps - 2) {
-          // Push back — the model stopped on step 0 without taking any action
+          // Push back — the model stopped without taking action
           messages.push({
             role: "user",
             content:
@@ -366,9 +377,10 @@ export class CodingAgent {
           continue;
         }
 
-        // Model wants to stop — run verification if files changed
+        // Model wants to stop — run verification only if a test command exists
         if (
           changedFiles &&
+          verifyCommand &&
           (context.allowedPermissions?.includes("execute") || context.onApproveCommand)
         ) {
           const verification = await this.tools.execute(
@@ -378,7 +390,7 @@ export class CodingAgent {
           );
           const exitCode = (verification.data as { exitCode?: number } | undefined)?.exitCode;
           if (!verification.success || exitCode !== 0) {
-            const summary = formatToolResult("run_command", verification);
+            const summary = formatToolResult("run_command", verification, context.repositoryPath);
             messages.push({
               role: "user",
               content: `Verification with \`${verifyCommand}\` failed. Diagnose the error and fix it:\n\n${summary}`,
@@ -393,6 +405,7 @@ export class CodingAgent {
           filesChanged,
           totalInputTokens,
           totalOutputTokens,
+          options.pricing,
         );
         this.messages = messages;
         return summary;
@@ -400,22 +413,54 @@ export class CodingAgent {
 
       context.signal?.throwIfAborted();
 
-      // Execute tool calls concurrently
+      // Execute tool calls concurrently with loop checks
       const toolResults = await Promise.all(
         response.toolCalls.map(async (call) => {
           context.signal?.throwIfAborted();
           options.onEvent?.({
             type: "tool.started",
             step: step + 1,
+            toolCallId: call.id,
             toolName: call.name,
             args: call.arguments as Record<string, unknown>,
           });
+
+          // 1. Loop prevention check: exact same call executed more than 3 times since last edit
+          const callKey = `${call.name}:${JSON.stringify(call.arguments)}`;
+          const runCount = (toolCallCounts.get(callKey) ?? 0) + 1;
+          toolCallCounts.set(callKey, runCount);
+
+          if (runCount > 3) {
+            const result: import("@forge/types").ToolResult<unknown> = {
+              success: false,
+              error: `Tool call blocked by loop prevention. You have already executed '${call.name}' with these identical arguments ${runCount - 1} times since your last file edit. Do not repeat the same call. If the file content or status has not changed, proceed to making an edit or completing the task.`,
+              durationMs: 0,
+              metadata: {},
+            };
+            options.onEvent?.({
+              type: "tool.finished",
+              step: step + 1,
+              toolCallId: call.id,
+              toolName: call.name,
+              success: false,
+            });
+            return { call, result };
+          }
+
+          // 2. Progress detector check: limit total non-edit tool calls
+          toolCallsSinceLastEdit++;
+          if (toolCallsSinceLastEdit > 12) {
+            throw new Error(
+              `Agent aborted: Loop detected. Executed ${toolCallsSinceLastEdit} consecutive tool calls without making any successful file edits.`,
+            );
+          }
 
           const result = await this.tools.execute(call.name, call.arguments, context);
 
           options.onEvent?.({
             type: "tool.finished",
             step: step + 1,
+            toolCallId: call.id,
             toolName: call.name,
             success: result.success,
           });
@@ -424,9 +469,11 @@ export class CodingAgent {
         }),
       );
 
+      let changedFilesThisStep = false;
       for (const { call, result } of toolResults) {
         if (changedTools.has(call.name) && result.success) {
           changedFiles = true;
+          changedFilesThisStep = true;
           // Track changed paths
           const d = result.data as { path?: string; filesPatched?: string[] } | undefined;
           if (d?.path) filesChanged.push(d.path);
@@ -434,7 +481,7 @@ export class CodingAgent {
         }
 
         // Use formatted summary instead of raw JSON to reduce context bloat
-        const formattedResult = formatToolResult(call.name, result);
+        const formattedResult = formatToolResult(call.name, result, context.repositoryPath);
         messages.push({
           role: "tool",
           toolCallId: call.id,
@@ -442,9 +489,14 @@ export class CodingAgent {
         });
       }
 
+      if (changedFilesThisStep) {
+        toolCallCounts.clear();
+        toolCallsSinceLastEdit = 0;
+      }
+
       context.signal?.throwIfAborted();
+      step += 1;
     }
-    throw new Error(`Agent exceeded its ${maxSteps}-step limit.`);
   }
 }
 
@@ -453,6 +505,7 @@ function buildFinalSummary(
   filesChanged: string[],
   inputTokens: number,
   outputTokens: number,
+  pricing?: { inputPerMillion: number; outputPerMillion: number },
 ): string {
   const parts: string[] = [content];
 
@@ -462,8 +515,15 @@ function buildFinalSummary(
   }
 
   if (inputTokens > 0 || outputTokens > 0) {
+    let costStr = "";
+    if (pricing) {
+      const cost =
+        (inputTokens / 1_000_000) * pricing.inputPerMillion +
+        (outputTokens / 1_000_000) * pricing.outputPerMillion;
+      costStr = ` (est. cost: $${cost.toFixed(4)})`;
+    }
     parts.push(
-      `\n**Tokens used:** ${inputTokens.toLocaleString()} in / ${outputTokens.toLocaleString()} out`,
+      `\n**Tokens used:** ${inputTokens.toLocaleString()} in / ${outputTokens.toLocaleString()} out${costStr}`,
     );
   }
 

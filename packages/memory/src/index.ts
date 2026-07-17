@@ -7,7 +7,8 @@ export interface MemoryData {
 }
 
 function getMemoryPath(repositoryPath: string): string {
-  return join(repositoryPath, ".forge", "memory.json");
+  const base = process.env.FORGE_CLI_ROOT || repositoryPath;
+  return join(base, ".forge", "memory.json");
 }
 
 export const MemoryStore = {
@@ -15,7 +16,18 @@ export const MemoryStore = {
     const memoryPath = getMemoryPath(repositoryPath);
     try {
       const content = await readFile(memoryPath, "utf8");
-      const data = JSON.parse(content) as MemoryData;
+      const parsed = JSON.parse(content);
+      if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed) ||
+        typeof parsed.facts !== "object" ||
+        parsed.facts === null ||
+        Array.isArray(parsed.facts)
+      ) {
+        return {};
+      }
+      const data = parsed as MemoryData;
       return data.facts ?? {};
     } catch {
       return {};
@@ -36,8 +48,9 @@ export const MemoryStore = {
       updatedAt: new Date().toISOString(),
     };
 
-    // Ensure .forge directory exists
-    await mkdir(join(repositoryPath, ".forge"), { recursive: true }).catch(() => {});
+    // Ensure directory for memoryPath exists
+    const base = process.env.FORGE_CLI_ROOT || repositoryPath;
+    await mkdir(join(base, ".forge"), { recursive: true }).catch(() => {});
     await writeFile(memoryPath, JSON.stringify(data, null, 2), "utf8");
     return facts;
   },
@@ -52,7 +65,9 @@ export const MemoryStore = {
       updatedAt: new Date().toISOString(),
     };
 
-    await mkdir(join(repositoryPath, ".forge"), { recursive: true }).catch(() => {});
+    // Ensure directory for memoryPath exists
+    const base = process.env.FORGE_CLI_ROOT || repositoryPath;
+    await mkdir(join(base, ".forge"), { recursive: true }).catch(() => {});
     await writeFile(memoryPath, JSON.stringify(data, null, 2), "utf8");
     return facts;
   },
