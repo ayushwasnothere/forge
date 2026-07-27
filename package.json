@@ -1,10 +1,11 @@
 {
   "name": "forge-code-ai",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "bin": {
-    "forge": "./apps/cli/src/index.ts"
+    "forge": "./dist/index.js"
   },
+  "files": ["dist/index.js", "LICENSE", "README.md", "package.json"],
   "description": "A modular, terminal-first AI coding agent",
   "license": "MIT",
   "author": "Forge Contributors",
@@ -15,6 +16,8 @@
   "keywords": ["ai", "coding-agent", "cli", "llm", "openai", "anthropic", "terminal"],
   "workspaces": ["apps/*", "packages/*"],
   "scripts": {
+    "build": "bun scripts/build.ts",
+    "prepublishOnly": "bun run build",
     "dev": "bun --watch apps/cli/src/index.ts",
     "start": "bun apps/cli/src/index.ts",
     "check": "bun run lint && bun run typecheck && bun run test",
