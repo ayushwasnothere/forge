@@ -1,8 +1,10 @@
 {
   "name": "forge-ai",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
+  "bin": {
+    "forge": "./apps/cli/src/index.ts"
+  },
   "description": "A modular, terminal-first AI coding agent",
   "license": "MIT",
   "author": "Forge Contributors",

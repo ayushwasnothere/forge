@@ -1,0 +1,7 @@
+*.mp4
+sandbox/
+.forge/
+.gemini/
+scratch/
+*.log
+.DS_Store
