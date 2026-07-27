@@ -1,0 +1,45 @@
+# Interactive REPL
+
+The interactive REPL (`forge chat` or simply `forge`) is the primary interface for working with Forge. It provides a real-time streaming chat interface with full ANSI markdown rendering and interactive tool approvals.
+
+## Slash Commands
+
+Within the REPL, control session state using slash commands:
+
+| Command | Description |
+|---|---|
+| `/help` | Show available slash commands |
+| `/new` | Start a new conversation session |
+| `/resume [id]` | Resume a past session by ID |
+| `/usedir [path]`, `/cd [path]` | Change active workspace directory |
+| `/model [alias]` | Switch model alias or model name |
+| `/models` | List all configured model aliases |
+| `/provider [name]` | Interactively configure provider |
+| `/setup` | Launch interactive setup wizard |
+| `/status` | Display session state, tokens, and estimated cost |
+| `/compact` | Compress conversation history to save context space |
+| `/cost` | Display estimated session cost breakdown |
+| `/history` | View full message history |
+| `/diff` | Review unstaged Git changes |
+| `/commit` | Auto-generate commit message and run git commit |
+| `/undo` | Revert changes made in the last agent step |
+| `/reset` | Clear session conversation history |
+| `/exit` | Exit the REPL |
+
+## Example Session
+
+```text
+$ forge chat --allow-write --allow-execute
+
+⚡ Forge REPL v0.1.1
+Type /help for slash commands or /exit to quit.
+
+Forge> /model fast
+Switched model to fast (Groq llama-3.3-70b-versatile).
+
+Forge> Add input validation to the login route using Zod
+🧠 Thinking...
+⚙️ read_file src/routes/login.ts ✔
+⚙️ apply_patch src/routes/login.ts ✔
+✅ Added Zod validation schema to login handler.
+```

@@ -1,0 +1,77 @@
+# Configuration
+
+Forge supports flexible configuration options ranging from interactive wizards to multi-model alias configs and single-model `.env` files.
+
+## Setup Wizard
+
+The fastest way to set up Forge is with the interactive wizard:
+
+```bash
+forge setup
+```
+
+This guides you through adding provider credentials, setting default models, and defining model aliases stored in `~/.forge/config.json`.
+
+## Multi-Model Configuration (`~/.forge/config.json`)
+
+For advanced setups with multiple providers and model aliases, configure `~/.forge/config.json`:
+
+```json
+{
+  "providers": {
+    "openrouter": {
+      "apiKey": "sk-or-..."
+    },
+    "agentrouter": {
+      "type": "openai",
+      "apiKey": "sk-qtf...",
+      "baseUrl": "https://agentrouter.org/v1"
+    },
+    "enterprise-proxy": {
+      "type": "anthropic",
+      "apiKey": "sk-ant-...",
+      "baseUrl": "https://anthropic.proxy.internal/v1"
+    }
+  },
+  "models": {
+    "sonnet": {
+      "provider": "openrouter",
+      "model": "anthropic/claude-sonnet-4"
+    },
+    "opus": {
+      "provider": "agentrouter",
+      "model": "claude-opus-4-6"
+    },
+    "fast": {
+      "provider": "groq",
+      "model": "llama-3.3-70b-versatile"
+    }
+  },
+  "defaultModel": "opus"
+}
+```
+
+In the interactive REPL, switch instantly between aliases:
+
+```text
+Forge> /model fast    # switches to Groq llama-3.3-70b
+Forge> /model opus    # switches to Anthropic claude-opus
+```
+
+## Single-Model Environment File (`.env`)
+
+Single-model `.env` files are also supported in your project root as a simple fallback:
+
+```dotenv
+# Provider: openrouter | openai | grok | anthropic | gemini | groq | ollama
+FORGE_PROVIDER=openrouter
+
+# API endpoint (optional — each provider has a default)
+FORGE_BASE_URL=https://openrouter.ai/api/v1
+
+# Your API key (not required for Ollama)
+FORGE_API_KEY=your-api-key-here
+
+# Model to use (must support tool/function calling)
+FORGE_MODEL=anthropic/claude-sonnet-4
+```

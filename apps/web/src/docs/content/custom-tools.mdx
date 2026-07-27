@@ -1,0 +1,50 @@
+# Custom Tools & Guidelines
+
+Forge can be customized using repo-level project guidelines (`FORGE.md`) and custom TypeScript tool definitions.
+
+## Project Guidelines (`FORGE.md`)
+
+Create a `FORGE.md` file in your repository root to supply custom instructions directly into Forge's system prompt:
+
+```markdown
+# Project Guidelines
+
+- Use TypeScript with strict mode enabled
+- Follow functional programming patterns; avoid class abstractions
+- Run `bun run check` to format and typecheck before committing
+- Never store secrets or API keys in repository files
+```
+
+Generate a starter `FORGE.md` using:
+
+```bash
+forge init
+```
+
+## Custom Tools (`forge.config.json`)
+
+Register custom tools in `forge.config.json` at your project root:
+
+```json
+{
+  "tools": ["./tools/db-migrate.ts", "./tools/deploy-preview.ts"]
+}
+```
+
+## Custom Tool Interface
+
+Each custom tool module exports a `RegisteredTool` object:
+
+```typescript
+import type { RegisteredTool } from "forge-code-ai";
+
+export const dbMigrateTool: RegisteredTool = {
+  name: "db_migrate",
+  description: "Run database migrations for local development environment",
+  permission: "execute",
+  async execute({ direction = "up" }: { direction?: "up" | "down" }) {
+    // Execution logic here
+    return { status: "success", applied: direction };
+  },
+};
+```

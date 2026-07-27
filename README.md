@@ -4,9 +4,12 @@
 
   <a href="https://www.npmjs.com/package/forge-code-ai"><img src="https://img.shields.io/npm/v/forge-code-ai.svg?style=flat-square" alt="npm version" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="license" /></a>
+  <br />
+  <p>📚 <b><a href="https://forge.dev">Documentation & Website</a></b></p>
 </div>
 
 ---
+
 
 **Forge** is an AI coding agent that lives in your terminal. It understands your repository, reads and edits files, runs shell commands, manages Git, and iterates autonomously using an LLM with parallel tool calling.
 

@@ -1,0 +1,47 @@
+# CLI Commands
+
+Forge provides CLI commands for interactive development, autonomous tasks, inspections, and environment setup.
+
+## Commands Overview
+
+| Command | Description |
+|---|---|
+| `forge` | Launch the interactive REPL (default) |
+| `forge chat` | Alias for the interactive REPL |
+| `forge setup` | Interactive setup wizard for providers & models |
+| `forge agent "<task>"` | Run a one-shot autonomous task |
+| `forge inspect <path>` | Read files or list directory symbols |
+| `forge replace <file> <old> <new>` | Perform exact text replacement in a file |
+| `forge init` | Scaffold a `FORGE.md` project guidelines file |
+| `forge health` | Check runtime and configuration health |
+| `forge sessions` | List saved sessions |
+
+## Command Options
+
+For `forge agent` and `forge chat`, the following options control agent behavior:
+
+| Option | Default | Description |
+|---|---|---|
+| `--allow-write` | `false` | Allow file creation, modification, and patches |
+| `--allow-execute` | `false` | Allow shell command execution |
+| `--max-steps <n>` | `20` | Maximum agent reasoning steps |
+| `--command-timeout <s>` | `60` | Shell command execution timeout in seconds |
+| `--provider <name>` | env | Override provider for this session |
+| `--session <id>` | — | Resume a specific saved session |
+| `--verbose` | `false` | Print raw tool input and output |
+
+## Examples
+
+```bash
+# Read-only repository query
+forge agent "Explain the authentication middleware"
+
+# Autonomous task with full execution permissions
+forge agent "Fix the failing unit tests" --allow-write --allow-execute
+
+# Inspect file symbols
+forge inspect src/index.ts --symbols
+
+# Perform exact text replacement
+forge replace src/config.ts "port: 3000" "port: 8080" --allow-write
+```

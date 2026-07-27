@@ -1,0 +1,37 @@
+# Session Management
+
+Forge automatically records conversation state and tool execution history into session files, allowing you to pause and resume work at any time.
+
+## Storage Location
+
+Sessions are saved as JSON files in your project directory:
+
+```text
+.forge/sessions/<session-id>.json
+```
+
+Each session file stores:
+- Full conversation message trajectory
+- Tool input parameters and execution outputs
+- Active model configuration and token usage statistics
+
+## Resuming Sessions
+
+Resume a session from the CLI using the `--session` flag:
+
+```bash
+forge agent "Continue with the refactoring" --session 8f3d1e2a
+```
+
+Or from within the interactive REPL:
+
+```text
+Forge> /resume 8f3d1e2a
+Resumed session 8f3d1e2a (12 messages, 4 tools executed).
+```
+
+To list all available saved sessions:
+
+```bash
+forge sessions
+```

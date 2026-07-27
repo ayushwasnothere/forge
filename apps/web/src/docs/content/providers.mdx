@@ -1,0 +1,30 @@
+# Providers
+
+Forge connects natively to leading LLM providers as well as local runners and custom proxy endpoints.
+
+## Supported Providers
+
+| Provider | `FORGE_PROVIDER` | API Key Required | Default Base Endpoint |
+|---|---|---|---|
+| **OpenRouter** | `openrouter` | Yes | `https://openrouter.ai/api/v1` |
+| **OpenAI** | `openai` | Yes | `https://api.openai.com/v1` |
+| **Anthropic** | `anthropic` | Yes | `https://api.anthropic.com/v1` |
+| **Groq** | `groq` | Yes | `https://api.groq.com/openai/v1` |
+| **xAI (Grok)** | `grok` | Yes | `https://api.x.ai/v1` |
+| **Google Gemini** | `gemini` | Yes | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| **Ollama** | `ollama` | No | `http://localhost:11434/v1` |
+
+## OpenAI-Compatible Endpoints
+
+Any OpenAI-compatible API host (e.g. vLLM, LM Studio, Anyscale, Together, enterprise proxies) is supported.
+
+Configure standard OpenAI compatibility using `.env`:
+
+```dotenv
+FORGE_PROVIDER=openai
+FORGE_BASE_URL=https://your-custom-proxy.internal/v1
+FORGE_API_KEY=your-key
+FORGE_MODEL=custom-model-id
+```
+
+Or configure custom base URLs in `~/.forge/config.json`.

@@ -1,0 +1,50 @@
+# Getting Started
+
+Forge is a modular, terminal-first AI coding agent. It reads and edits files, runs
+shell commands, manages Git, and iterates autonomously using an LLM with parallel
+tool calling.
+
+## Install
+
+```bash
+npm i -g forge-code-ai
+```
+
+Forge also runs great from source with [Bun](https://bun.sh):
+
+```bash
+git clone https://github.com/ayushwasnothere/forge.git
+cd forge && bun install
+```
+
+## Configure a provider
+
+Run the interactive setup wizard to add a provider and model aliases:
+
+```bash
+forge setup
+```
+
+See [Configuration](/docs/configuration) for the full config format.
+
+## First run
+
+Read-only by default — Forge can explore your repo without changing anything:
+
+```bash
+forge agent "Explain the architecture of this repository"
+```
+
+Let it make changes by granting write and execute permission:
+
+```bash
+forge agent "Add input validation to the login handler" --allow-write --allow-execute
+```
+
+Or start an interactive session:
+
+```bash
+forge chat --allow-write --allow-execute
+```
+
+Next: [CLI Commands](/docs/commands) · [Interactive REPL](/docs/repl) · [Permissions](/docs/permissions)

@@ -1,0 +1,26 @@
+# Permissions
+
+Forge is **safe by default**, employing a strict deny-by-default permission model for operations that mutate your codebase or run shell commands.
+
+## Permission Model
+
+| Permission | Default | Flag | Unlocked Capabilities |
+|---|---|---|---|
+| **Read** | ✅ Always enabled | — | `read_file`, `list_dir`, `grep_search`, `git status`, symbol listing |
+| **Write** | ❌ Interactive prompt | `--allow-write` | `write_to_file`, `replace_file_content`, `apply_patch`, `git commit` |
+| **Execute** | ❌ Interactive prompt | `--allow-execute` | `run_command` (shell command execution) |
+
+## Diff Approval UI
+
+When `--allow-write` or `--allow-execute` is omitted, Forge prompts you for explicit interactive approval before executing any mutating tool call:
+
+```text
+Forge wants to modify src/auth.ts:
+
+- const isValid = pass === hash;
++ const isValid = await argon2.verify(hash, pass);
+
+Approve change? [y/N]:
+```
+
+You can inspect side-by-side or inline color-coded diff previews in the terminal before allowing changes to land.
