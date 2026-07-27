@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
 
 import { existsSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { MultiLinePrompt } from "@clack/core";
 
 import {
@@ -47,7 +48,16 @@ import {
 import type { ModelMessage } from "@forge/types";
 import { Command } from "commander";
 import pc from "picocolors";
-import { loadConfig, loadGlobalConfig } from "./config";
+import {
+  type GlobalForgeConfig,
+  type ResolvedModel,
+  getDefaultModelAlias,
+  loadConfig,
+  loadGlobalConfig,
+  resolveModel,
+  saveGlobalConfig,
+} from "./config";
+import { addModelAliasWizard, runConfigWizard } from "./config-wizard";
 import {
   clearStreamedText,
   generateVisualDiff,
@@ -57,6 +67,18 @@ import {
 } from "./tui";
 
 const program = new Command();
+
+/** Read version from the CLI package.json at build/runtime. */
+async function getVersion(): Promise<string> {
+  try {
+    const cliDir = path.dirname(fileURLToPath(import.meta.url));
+    const pkgPath = path.join(cliDir, "..", "package.json");
+    const pkg = JSON.parse(await readFile(pkgPath, "utf8")) as { version?: string };
+    return pkg.version ?? "0.1.0";
+  } catch {
+    return "0.1.0";
+  }
+}
 
 async function loadExternalTools(registry: ToolRegistry, root: string): Promise<void> {
   const { readFile } = await import("node:fs/promises");
@@ -88,41 +110,23 @@ async function loadExternalTools(registry: ToolRegistry, root: string): Promise<
   }
 }
 
+const version = await getVersion();
+
 program
   .name("forge")
-  .description("A modular, terminal-first AI coding-agent runtime")
-  .version("0.1.0")
-  .action(async () => {
-    const globalConfig = await loadGlobalConfig();
-    process.env.FORGE_CLI_ROOT = globalConfig.forgePath || homedir();
-    const store = new SessionStore(sessionsRoot());
-    const sessions = await store.list().catch(() => []);
-    const currentPath = path.resolve(process.cwd());
-    const matched = sessions.filter(
-      (s) => s.repositoryPath && path.resolve(s.repositoryPath) === currentPath,
-    );
-    const sorted = matched.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
-    const latest = sorted[0];
-    if (latest) {
-      console.log(
-        `Forge v0.1.0\n\n🌿 Active session found: ${pc.dim(latest.id.slice(0, 8))}… "${latest.task}"\nRun: ${pc.cyan("bun run start -- chat -c")} to resume, or ${pc.cyan("bun run start -- chat")} to start a new chat.`,
-      );
-    } else {
-      console.log("Forge v0.1.0\n\nNo session active in the current directory.");
-      const startChat = await confirm({
-        message: `Do you want to start an interactive chat in the current directory ("${currentPath}")?`,
-        initialValue: true,
-      });
-      if (startChat && typeof startChat === "boolean") {
-        await runChatAction({
-          maxSteps: "60",
-          commandTimeout: "60",
-          workspace: currentPath,
-        });
-      } else {
-        outro("To start a chat in another directory, run: bun run start -- chat");
-      }
-    }
+  .description("A modular, terminal-first AI coding agent")
+  .version(version)
+  .option("--allow-write", "allow file writes")
+  .option("--allow-execute", "allow shell commands")
+  .option("--max-steps <number>", "maximum agent steps per prompt", "60")
+  .option("--command-timeout <seconds>", "shell-command timeout", "60")
+  .option("--provider <name>", "openrouter, openai, grok, anthropic, ollama, or groq")
+  .option("--session <id>", "resume a saved Forge session")
+  .option("-c, --continue", "resume the most recent saved session")
+  .option("--verbose", "print raw tool output alongside formatted summaries")
+  .option("--workspace <path>", "root workspace directory")
+  .action(async (options: ChatOptions) => {
+    await runChatAction({ ...options, workspace: options.workspace ?? process.cwd() });
   });
 
 program
@@ -780,18 +784,6 @@ program
           timestamp: new Date().toISOString(),
         });
 
-        await store.save({
-          id: sessionId,
-          task: loadedSession?.task ?? agentTask,
-          repositoryPath: workspacePath,
-          result: answer,
-          createdAt: loadedSession?.createdAt ?? new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          messages: agent.messages,
-          totalInputTokens: agent.totalInputTokens,
-          totalOutputTokens: agent.totalOutputTokens,
-        });
-
         if (!options.nonInteractive) {
           // Content was already streamed live; show only the metadata footer
           const metaLines: string[] = [];
@@ -953,7 +945,7 @@ program
   .option("--allow-execute", "allow shell commands")
   .option("--max-steps <number>", "maximum agent steps per prompt", "60")
   .option("--command-timeout <seconds>", "shell-command timeout", "60")
-  .option("--provider <name>", "openrouter, openai, grok, anthropic, ollama, or groq")
+  .option("--provider <name>", "openrouter, openai, grok, anthropic, ollama, groq, or gemini")
   .option("--session <id>", "resume a saved Forge session")
   .option("-c, --continue", "resume the most recent saved session")
   .option("--verbose", "print raw tool output alongside formatted summaries")
@@ -976,14 +968,34 @@ async function runChatAction(options: ChatOptions) {
   const globalConfig = await loadGlobalConfig();
   process.env.FORGE_CLI_ROOT = globalConfig.forgePath || homedir();
 
-  const workspacePath = path.resolve(process.cwd(), await promptWorkspace(options.workspace));
+  let workspacePath = path.resolve(process.cwd(), await promptWorkspace(options.workspace));
   await mkdir(workspacePath, { recursive: true });
-  const apiKey = process.env.FORGE_API_KEY;
-  let currentModel = process.env.FORGE_MODEL ?? "";
-  let currentProvider = (options.provider ??
-    process.env.FORGE_PROVIDER ??
-    "openrouter") as ProviderKind;
-  if (!currentModel) throw new Error("Set FORGE_MODEL before using the agent command.");
+
+  // Resolve initial model from config aliases, CLI flags, or env vars
+  const defaultAlias = getDefaultModelAlias(globalConfig);
+  if (!defaultAlias && !options.provider) {
+    throw new Error(
+      "No model configured. Set FORGE_MODEL in .env, or configure models in ~/.forge/config.json.",
+    );
+  }
+
+  let currentActiveAlias: string | undefined = defaultAlias;
+  const resolved: ResolvedModel = resolveModel(
+    globalConfig,
+    defaultAlias ?? "",
+    (options.provider ?? process.env.FORGE_PROVIDER ?? "openrouter") as ProviderKind,
+  );
+  // CLI --provider flag overrides the resolved provider
+  if (options.provider) {
+    resolved.provider = options.provider as ProviderKind;
+  }
+
+  let currentModel = resolved.model;
+  let currentProvider = resolved.provider;
+  let currentType = resolved.type;
+  let currentApiKey = resolved.apiKey;
+  let currentBaseUrl = resolved.baseUrl;
+
   const registry = new ToolRegistry();
   for (const tool of BUILTIN_TOOLS) {
     registry.register(tool);
@@ -992,9 +1004,10 @@ async function runChatAction(options: ChatOptions) {
   let agent = new CodingAgent(
     createProvider({
       provider: currentProvider,
-      ...(apiKey ? { apiKey } : {}),
+      ...(currentType ? { type: currentType } : {}),
+      ...(currentApiKey ? { apiKey: currentApiKey } : {}),
       model: currentModel,
-      ...(process.env.FORGE_BASE_URL ? { baseUrl: process.env.FORGE_BASE_URL } : {}),
+      ...(currentBaseUrl ? { baseUrl: currentBaseUrl } : {}),
     }),
     registry,
   );
@@ -1009,7 +1022,7 @@ async function runChatAction(options: ChatOptions) {
     hasAllowExecute ? "execute" : undefined,
   ].filter((value): value is "read" | "write" | "execute" => value !== undefined);
 
-  const store = new SessionStore(workspacePath);
+  const store = new SessionStore(sessionsRoot());
   let sessionId: string = crypto.randomUUID();
   let loadedSession: StoredSession | undefined;
 
@@ -1078,8 +1091,8 @@ async function runChatAction(options: ChatOptions) {
   });
 
   try {
-    const ctxResult = await new RepositoryContextBuilder().buildStructured(workspacePath);
-    const repositoryContext = ctxResult.text;
+    let ctxResult = await new RepositoryContextBuilder().buildStructured(workspacePath);
+    let repositoryContext = ctxResult.text;
     const bannerParts = [
       pc.dim(currentModel),
       ctxResult.gitBranch ? pc.gray(`⎇ ${ctxResult.gitBranch}`) : null,
@@ -1114,8 +1127,11 @@ async function runChatAction(options: ChatOptions) {
               `${pc.cyan("/exit")}, ${pc.cyan("/quit")}   Exit the chat session`,
               `${pc.cyan("/new")}           Start a new clean session`,
               `${pc.cyan("/resume")} [id]   List saved sessions or restore one`,
-              `${pc.cyan("/provider")} [p] [m]  Switch provider/model`,
-              `${pc.cyan("/model")} [name]  Switch model for current provider`,
+              `${pc.cyan("/usedir")}, ${pc.cyan("/cd")} [path] Change active workspace directory`,
+              `${pc.cyan("/model")} [alias]  Switch model (use configured alias or raw name)`,
+              `${pc.cyan("/models")}        List all configured model aliases`,
+              `${pc.cyan("/provider")} [p] [m]  Interactive provider setup`,
+              `${pc.cyan("/setup")}         Configure providers & models (saves to config)`,
               `${pc.cyan("/status")}        Show session info & memory facts`,
               `${pc.cyan("/compact")}       Manually compress older history`,
               `${pc.cyan("/cost")}          Show cumulative session token usage/costs`,
@@ -1127,6 +1143,43 @@ async function runChatAction(options: ChatOptions) {
             ].join("\n"),
             "⚡ forge  commands",
           );
+          continue;
+        }
+        if (input.startsWith("/usedir") || input.startsWith("/cd")) {
+          const parts = input.split(" ");
+          let targetPath = parts.slice(1).join(" ").trim();
+
+          if (!targetPath) {
+            const pathInput = await text({
+              message: "Enter workspace directory path",
+              defaultValue: workspacePath,
+              placeholder: workspacePath,
+            });
+            if (isCancel(pathInput)) continue;
+            targetPath = String(pathInput).trim();
+          }
+
+          if (!targetPath) continue;
+
+          const resolvedPath = path.resolve(workspacePath, targetPath);
+          if (!existsSync(resolvedPath)) {
+            const createDir = await confirm({
+              message: `Directory "${resolvedPath}" does not exist. Create it?`,
+              initialValue: true,
+            });
+            if (isCancel(createDir) || !createDir) continue;
+            await mkdir(resolvedPath, { recursive: true });
+          }
+
+          workspacePath = resolvedPath;
+          await loadExternalTools(registry, workspacePath);
+          ctxResult = await new RepositoryContextBuilder().buildStructured(workspacePath);
+          repositoryContext = ctxResult.text;
+
+          log.success(`📂 Switched workspace directory to ${pc.cyan(workspacePath)}`);
+          if (ctxResult.gitBranch) {
+            log.info(`🌿 Branch: ${pc.dim(ctxResult.gitBranch)}`);
+          }
           continue;
         }
         if (input === "/status") {
@@ -1165,12 +1218,135 @@ async function runChatAction(options: ChatOptions) {
           );
           continue;
         }
+        if (input === "/setup") {
+          await runConfigWizard();
+          const reloaded = await loadGlobalConfig();
+          Object.assign(globalConfig, reloaded);
+          continue;
+        }
+        if (input === "/models") {
+          const aliases = Object.keys(globalConfig.models ?? {});
+          if (aliases.length === 0) {
+            log.info(
+              "No model aliases configured in ~/.forge/config.json. Use /setup to create aliases.",
+            );
+          } else {
+            const lines = aliases.map((alias) => {
+              const entry = globalConfig.models?.[alias];
+              const isActive = alias === currentActiveAlias || entry?.model === currentModel;
+              const badge = isActive ? pc.green(" (active)") : "";
+              return `  ${pc.bold(alias)}: ${entry?.provider}/${entry?.model}${badge}`;
+            });
+            note(lines.join("\n"), "Configured Model Aliases");
+          }
+          continue;
+        }
+        if (input.startsWith("/model")) {
+          const parts = input.split(" ");
+          let target = parts[1]?.trim();
+
+          const aliases = globalConfig.models ?? {};
+          const aliasKeys = Object.keys(aliases);
+
+          if (!target) {
+            const options: Array<{ value: string; label: string }> = aliasKeys.map((a) => {
+              const entry = aliases[a];
+              const isActive = a === currentActiveAlias || entry?.model === currentModel;
+              const activeBadge = isActive ? " (active)" : "";
+              return {
+                value: a,
+                label: `${a} -> ${entry?.provider}/${entry?.model}${activeBadge}`,
+              };
+            });
+
+            options.push({ value: "__add__", label: "➕ Add a new model alias to config..." });
+            options.push({ value: "__custom__", label: "✏️  Use a one-off custom model name..." });
+
+            const selected = await select({
+              message: "Select model to switch to",
+              options,
+              initialValue: currentActiveAlias ?? aliasKeys[0],
+            });
+
+            if (isCancel(selected)) continue;
+
+            if (selected === "__add__") {
+              const createdAlias = await addModelAliasWizard(globalConfig);
+              if (!createdAlias) continue;
+              target = createdAlias;
+            } else if (selected === "__custom__") {
+              const customName = await text({
+                message: "Enter custom model name",
+                defaultValue: currentModel,
+                placeholder: currentModel,
+              });
+              if (isCancel(customName)) continue;
+              target = String(customName).trim();
+            } else {
+              target = String(selected);
+            }
+          } else if (target === "add" || target === "new" || target === "create") {
+            const createdAlias = await addModelAliasWizard(globalConfig);
+            if (!createdAlias) continue;
+            target = createdAlias;
+          }
+
+          if (!target) continue;
+
+          const resolvedTarget = resolveModel(globalConfig, target, currentProvider);
+          currentProvider = resolvedTarget.provider;
+          currentType = resolvedTarget.type;
+          currentModel = resolvedTarget.model;
+          currentApiKey = resolvedTarget.apiKey;
+          currentBaseUrl = resolvedTarget.baseUrl;
+          currentActiveAlias = aliases[target] ? target : undefined;
+
+          if (currentProvider !== "ollama" && !currentApiKey) {
+            const keyInput = await text({
+              message: `API Key required for provider "${currentProvider}"`,
+              placeholder: `paste your ${currentProvider} API key here`,
+            });
+            if (isCancel(keyInput)) continue;
+            currentApiKey = String(keyInput).trim();
+            if (currentApiKey) {
+              globalConfig.providers = globalConfig.providers ?? {};
+              globalConfig.providers[currentProvider] = {
+                ...globalConfig.providers[currentProvider],
+                apiKey: currentApiKey,
+              };
+              await saveGlobalConfig(globalConfig);
+              log.success(`💾 Saved API Key for "${currentProvider}" to ~/.forge/config.json.`);
+            }
+          }
+
+          const oldMessages = agent.messages;
+          const oldInput = agent.totalInputTokens;
+          const oldOutput = agent.totalOutputTokens;
+          agent = new CodingAgent(
+            createProvider({
+              provider: currentProvider,
+              ...(currentType ? { type: currentType } : {}),
+              model: currentModel,
+              ...(currentApiKey ? { apiKey: currentApiKey } : {}),
+              ...(currentBaseUrl ? { baseUrl: currentBaseUrl } : {}),
+            }),
+            registry,
+          );
+          agent.messages = oldMessages;
+          agent.totalInputTokens = oldInput;
+          agent.totalOutputTokens = oldOutput;
+
+          log.success(
+            `🧠 Switched model to ${currentProvider}/${currentModel}${currentActiveAlias ? ` (alias: ${currentActiveAlias})` : ""}`,
+          );
+          continue;
+        }
         if (input.startsWith("/provider")) {
           const parts = input.split(" ");
           let nextProvider = parts[1]?.trim() as ProviderKind | undefined;
           let nextModel = parts[2]?.trim();
-          let nextApiKey = apiKey;
-          let nextUrl = process.env.FORGE_BASE_URL || "";
+          let nextApiKey = currentApiKey;
+          let nextUrl = currentBaseUrl || "";
 
           if (!nextProvider) {
             // Interactive setup!
@@ -1183,6 +1359,7 @@ async function runChatAction(options: ChatOptions) {
                 { value: "anthropic", label: "Anthropic" },
                 { value: "ollama", label: "Ollama (Local)" },
                 { value: "groq", label: "Groq" },
+                { value: "gemini", label: "Google Gemini" },
               ],
               initialValue: currentProvider,
             });
@@ -1198,6 +1375,7 @@ async function runChatAction(options: ChatOptions) {
               else if (nextProvider === "grok") defaultModel = "grok-beta";
               else if (nextProvider === "ollama") defaultModel = "llama3";
               else if (nextProvider === "groq") defaultModel = "mixtral-8x7b-32768";
+              else if (nextProvider === "gemini") defaultModel = "gemini-2.5-flash";
             }
 
             const chosenModel = await text({
@@ -1211,7 +1389,7 @@ async function runChatAction(options: ChatOptions) {
             // API Key (skip for ollama)
             if (nextProvider !== "ollama") {
               const envVar = `FORGE_${nextProvider.toUpperCase()}_API_KEY`;
-              const existingKey = process.env[envVar] || apiKey || "";
+              const existingKey = process.env[envVar] || currentApiKey || "";
               const keyInput = await text({
                 message: `Enter API Key (prefilled with ${envVar} if set)`,
                 defaultValue: existingKey,
@@ -1231,6 +1409,8 @@ async function runChatAction(options: ChatOptions) {
                 defaultBaseUrl = "https://api.anthropic.com/v1";
               else if (nextProvider === "ollama") defaultBaseUrl = "http://localhost:11434/v1";
               else if (nextProvider === "groq") defaultBaseUrl = "https://api.groq.com/openai/v1";
+              else if (nextProvider === "gemini")
+                defaultBaseUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
             }
 
             const urlInput = await text({
@@ -1240,10 +1420,27 @@ async function runChatAction(options: ChatOptions) {
             });
             if (isCancel(urlInput)) continue;
             nextUrl = String(urlInput).trim();
+
+            const saveConfig = await confirm({
+              message: "Save provider credentials to ~/.forge/config.json?",
+              initialValue: true,
+            });
+            if (saveConfig && typeof saveConfig === "boolean") {
+              globalConfig.providers = globalConfig.providers ?? {};
+              globalConfig.providers[nextProvider] = {
+                ...(nextApiKey ? { apiKey: nextApiKey } : {}),
+                ...(nextUrl ? { baseUrl: nextUrl } : {}),
+              };
+              await saveGlobalConfig(globalConfig);
+              log.success(`💾 Saved provider "${nextProvider}" to global config.`);
+            }
           }
 
           currentProvider = nextProvider;
           if (nextModel) currentModel = nextModel;
+          currentApiKey = nextApiKey;
+          currentBaseUrl = nextUrl;
+          currentActiveAlias = undefined;
 
           // Re-instantiate agent with new provider details
           const oldMessages = agent.messages;
@@ -1253,8 +1450,8 @@ async function runChatAction(options: ChatOptions) {
             createProvider({
               provider: currentProvider,
               model: currentModel,
-              ...(nextApiKey ? { apiKey: nextApiKey } : {}),
-              ...(nextUrl ? { baseUrl: nextUrl } : {}),
+              ...(currentApiKey ? { apiKey: currentApiKey } : {}),
+              ...(currentBaseUrl ? { baseUrl: currentBaseUrl } : {}),
             }),
             registry,
           );
@@ -1262,41 +1459,6 @@ async function runChatAction(options: ChatOptions) {
           agent.totalInputTokens = oldInput;
           agent.totalOutputTokens = oldOutput;
           log.success(`🔌 Switched provider to ${currentProvider} (Model: ${currentModel})`);
-          continue;
-        }
-        if (input.startsWith("/model")) {
-          const parts = input.split(" ");
-          let nextModel = parts[1]?.trim();
-
-          if (!nextModel) {
-            const modelInput = await text({
-              message: "Enter model name",
-              defaultValue: currentModel,
-              placeholder: currentModel,
-            });
-            if (isCancel(modelInput)) continue;
-            nextModel = String(modelInput).trim();
-          }
-
-          currentModel = nextModel;
-
-          // Re-instantiate agent with new model
-          const oldMessages = agent.messages;
-          const oldInput = agent.totalInputTokens;
-          const oldOutput = agent.totalOutputTokens;
-          agent = new CodingAgent(
-            createProvider({
-              provider: currentProvider,
-              model: currentModel,
-              ...(apiKey ? { apiKey } : {}),
-              ...(process.env.FORGE_BASE_URL ? { baseUrl: process.env.FORGE_BASE_URL } : {}),
-            }),
-            registry,
-          );
-          agent.messages = oldMessages;
-          agent.totalInputTokens = oldInput;
-          agent.totalOutputTokens = oldOutput;
-          log.success(`🧠 Switched model to ${currentModel}`);
           continue;
         }
         if (input === "/new") {
@@ -1652,6 +1814,13 @@ program
       );
       process.exitCode = 1;
     }
+  });
+
+program
+  .command("setup")
+  .description("Run interactive setup wizard to configure providers and model aliases")
+  .action(async () => {
+    await runConfigWizard();
   });
 
 program.parse();

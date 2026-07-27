@@ -1,7 +1,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, join, parse, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { MemoryStore } from "@forge/memory";
 import type { Tool, ToolExecutionContext, ToolResult } from "@forge/types";
@@ -380,14 +380,7 @@ export const findFilesTool: RegisteredTool<
       if (typeof Bun !== "undefined" && typeof Bun.Glob !== "undefined") {
         // G5: Use Bun.Glob for correct and fast glob matching when available
         const glob = new Bun.Glob(pattern);
-        const excludeRegexes = excludePatterns.map((p) => {
-          const r = p
-            .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-            .replace(/\*\*/g, ".*")
-            .replace(/\*/g, "[^/]*")
-            .replace(/\?/g, "[^/]");
-          return new RegExp(`^${r}$`);
-        });
+        const excludeRegexes = excludePatterns.map(globToRegExp);
 
         for await (const file of glob.scan({ cwd: repoRoot, onlyFiles: true })) {
           const normalized = file.replace(/\\/g, "/");
@@ -416,22 +409,8 @@ async function globMatch(
   skipDirs: Set<string>,
   extraExclude: string[],
 ): Promise<string[]> {
-  const regexStr = pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*\*/g, "§DSTAR§")
-    .replace(/\*/g, "[^/]*")
-    .replace(/§DSTAR§/g, ".*")
-    .replace(/\?/g, "[^/]");
-  const regex = new RegExp(`^${regexStr}$`);
-
-  const excludeRegexes = extraExclude.map((p) => {
-    const r = p
-      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-      .replace(/\*\*/g, ".*")
-      .replace(/\*/g, "[^/]*")
-      .replace(/\?/g, "[^/]");
-    return new RegExp(`^${r}$`);
-  });
+  const regex = globToRegExp(pattern);
+  const excludeRegexes = extraExclude.map(globToRegExp);
 
   const results: string[] = [];
   async function walk(dir: string) {
@@ -450,6 +429,25 @@ async function globMatch(
   }
   await walk(root);
   return results.sort();
+}
+
+/**
+ * Translate a glob pattern to an anchored RegExp. A leading `**​/` (or `/**​/`)
+ * matches zero or more directories, so `**​/*.ts` also matches a root-level
+ * `index.ts`. `**` matches across path separators, `*` within a segment.
+ */
+function globToRegExp(pattern: string): RegExp {
+  const DSTAR_SLASH = " DSS ";
+  const DSTAR = " DS ";
+  const body = pattern
+    .replace(/\*\*\//g, DSTAR_SLASH)
+    .replace(/\*\*/g, DSTAR)
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\?/g, "[^/]")
+    .replace(new RegExp(DSTAR_SLASH, "g"), "(?:.*/)?")
+    .replace(new RegExp(DSTAR, "g"), ".*");
+  return new RegExp(`^${body}$`);
 }
 export const listSymbolsTool: RegisteredTool<
   { path: string },
@@ -607,6 +605,7 @@ export const replaceTextTool: RegisteredTool<
         );
       }
 
+      const oldMatchStart = content.indexOf(oldText);
       const newContent = content.split(oldText).join(newText);
       if (context.onApproveFileChange) {
         const approved = await context.onApproveFileChange(path, newContent, content);
@@ -623,8 +622,7 @@ export const replaceTextTool: RegisteredTool<
       // Build a ±3-line context snippet around the changed region so the model
       // can self-verify the edit without a follow-up read_file call.
       const newLines = newContent.split("\n");
-      const changeStart = newContent.indexOf(newText);
-      const linesBefore = newContent.slice(0, changeStart).split("\n").length - 1;
+      const linesBefore = content.slice(0, Math.max(0, oldMatchStart)).split("\n").length - 1;
       const contextFrom = Math.max(0, linesBefore - 3);
       const contextTo = Math.min(newLines.length, linesBefore + newText.split("\n").length + 3);
       const snippet = newLines
@@ -722,8 +720,7 @@ async function applyUnifiedDiff(
   repositoryPath: string,
   context?: ToolExecutionContext,
 ): Promise<ApplyPatchResult> {
-  // Parse unified diff format
-  const fileBlocks = patchText.split(/^(?=--- )/m).filter((b) => b.trim());
+  const fileBlocks = splitFileBlocks(patchText);
   const result: ApplyPatchResult = { filesPatched: [], hunksApplied: 0, hunksRejected: 0 };
 
   for (const block of fileBlocks) {
@@ -738,31 +735,35 @@ async function applyUnifiedDiff(
     if (!targetPath || targetPath === "/dev/null") continue;
 
     try {
-      const absolutePath = resolve(repositoryPath, targetPath);
-      // Verify within repo
+      // Route through the shared confinement helper (symlink + drive checks).
+      const absolutePath = resolveRepositoryPath(repositoryPath, targetPath);
       const rel = relative(resolve(repositoryPath), absolutePath);
-      if (rel.startsWith("..")) continue;
 
       const originalContent = await readFile(absolutePath, "utf8").catch(() => "");
-      const contentLines = originalContent.split("\n");
+      const contentLines = originalContent.replace(/\r\n/g, "\n").split("\n");
 
-      // Parse and apply hunks into contentLines (in memory only for now)
+      // Apply hunks all-or-nothing: verify every hunk against the file first.
+      // If any hunk fails context/removal verification we reject the whole file
+      // rather than write a half-applied (corrupt) result.
       const hunks = parseHunks(lines);
       let offset = 0;
-      let fileHunksApplied = 0;
-      let fileHunksRejected = 0;
+      let allApplied = true;
       for (const hunk of hunks) {
         const applied = applyHunk(contentLines, hunk, offset);
         if (applied.success) {
           offset += applied.offset;
-          fileHunksApplied++;
         } else {
-          fileHunksRejected++;
+          allApplied = false;
+          break;
         }
       }
 
+      if (!allApplied) {
+        result.hunksRejected += hunks.length;
+        continue;
+      }
+
       const content = contentLines.join("\n");
-      // E6: Ask for approval BEFORE incrementing hunksApplied
       if (context?.onApproveFileChange) {
         const approved = await context.onApproveFileChange(
           targetPath,
@@ -770,15 +771,12 @@ async function applyUnifiedDiff(
           originalContent || undefined,
         );
         if (!approved) {
-          // User rejected — count all attempted hunks as rejected, none as applied
           result.hunksRejected += hunks.length;
           continue;
         }
       }
 
-      // Approval granted (or no approval callback) — commit counts and write
-      result.hunksApplied += fileHunksApplied;
-      result.hunksRejected += fileHunksRejected;
+      result.hunksApplied += hunks.length;
       await mkdir(dirname(absolutePath), { recursive: true });
       await writeFile(absolutePath, content, "utf8");
       result.filesPatched.push(rel.replace(/\\/g, "/"));
@@ -787,6 +785,28 @@ async function applyUnifiedDiff(
     }
   }
   return result;
+}
+
+/**
+ * Split a unified diff into per-file blocks. A `--- ` line only begins a new
+ * block when the following line is a `+++ ` header — this avoids splitting on
+ * removed content lines that happen to start with "--- ".
+ */
+function splitFileBlocks(patchText: string): string[] {
+  const lines = patchText.split("\n");
+  const blocks: string[] = [];
+  let current: string[] | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    const isHeader = line.startsWith("--- ") && (lines[i + 1] ?? "").startsWith("+++ ");
+    if (isHeader) {
+      if (current?.join("\n").trim()) blocks.push(current.join("\n"));
+      current = [];
+    }
+    if (current) current.push(line);
+  }
+  if (current?.join("\n").trim()) blocks.push(current.join("\n"));
+  return blocks;
 }
 
 interface Hunk {
@@ -809,42 +829,72 @@ function parseHunks(diffLines: string[]): Hunk[] {
   return hunks;
 }
 
+/**
+ * Apply one hunk by walking its body in order against `fileLines`, starting near
+ * the hunk's declared start position. Context (" ") and removal ("-") lines must
+ * match the current file line; additions ("+") are inserted. If any context or
+ * removal line fails to match — even after a small ±offset search — the hunk is
+ * rejected and `fileLines` is left untouched.
+ */
 function applyHunk(
   fileLines: string[],
   hunk: Hunk,
   offset: number,
 ): { success: boolean; offset: number } {
-  const insertAt = hunk.startLine - 1 + offset;
-  const removals = hunk.lines.filter((l) => l.startsWith("-")).map((l) => l.slice(1));
-  const additions = hunk.lines.filter((l) => l.startsWith("+")).map((l) => l.slice(1));
-  const contextLines = hunk.lines.filter((l) => l.startsWith(" ")).map((l) => l.slice(1));
+  // Locate the actual start: the first context/removal line may have drifted
+  // from startLine due to earlier hunks, so search a ±5 window for alignment.
+  const anchor = firstAnchorLine(hunk.lines);
+  let start = hunk.startLine - 1 + offset;
+  if (anchor !== null) {
+    const found = findAnchor(fileLines, anchor, start);
+    if (found === -1) return { success: false, offset: 0 };
+    start = found;
+  } else {
+    // Pure-insertion hunk (no context/removals): clamp to a valid position.
+    if (start < 0) start = 0;
+    if (start > fileLines.length) start = fileLines.length;
+  }
 
-  // Verify context lines exist in the file near the target position
-  // Allow a ±5 line fuzzy window to account for prior hunk offsets
-  if (contextLines.length > 0) {
-    const searchStart = Math.max(0, insertAt - 5);
-    const searchEnd = Math.min(fileLines.length, insertAt + removals.length + 5);
-    let contextIdx = 0;
-    for (let i = searchStart; i < searchEnd && contextIdx < contextLines.length; i++) {
-      if (fileLines[i] === contextLines[contextIdx]) contextIdx++;
-    }
-    // If not all context lines were found, reject the hunk
-    if (contextIdx < contextLines.length) {
-      return { success: false, offset: 0 };
+  // Verify and build the replacement by walking the hunk body in order.
+  const patched: string[] = [];
+  let cursor = start;
+  for (const line of hunk.lines) {
+    const kind = line[0];
+    const text = line.slice(1);
+    if (kind === " ") {
+      if (fileLines[cursor] !== text) return { success: false, offset: 0 };
+      patched.push(text);
+      cursor++;
+    } else if (kind === "-") {
+      if (fileLines[cursor] !== text) return { success: false, offset: 0 };
+      cursor++; // drop the removed line
+    } else if (kind === "+") {
+      patched.push(text);
     }
   }
 
-  // Find block to replace
-  const removeCount = removals.length;
-  const startIdx = insertAt;
+  const removedCount = cursor - start;
+  fileLines.splice(start, removedCount, ...patched);
+  return { success: true, offset: patched.length - removedCount };
+}
 
-  if (startIdx < 0 || startIdx > fileLines.length) {
-    return { success: false, offset: 0 };
+/** First context/removal line text of a hunk (the alignment anchor), or null. */
+function firstAnchorLine(hunkLines: string[]): string | null {
+  for (const line of hunkLines) {
+    if (line.startsWith(" ") || line.startsWith("-")) return line.slice(1);
   }
+  return null;
+}
 
-  // Remove lines and insert additions
-  fileLines.splice(startIdx, removeCount, ...additions);
-  return { success: true, offset: additions.length - removeCount };
+/** Find `anchor` in `fileLines` near `guess` (exact hit first, then ±5 window). */
+function findAnchor(fileLines: string[], anchor: string, guess: number): number {
+  if (fileLines[guess] === anchor) return guess;
+  for (let delta = 1; delta <= 5; delta++) {
+    if (guess - delta >= 0 && fileLines[guess - delta] === anchor) return guess - delta;
+    if (guess + delta < fileLines.length && fileLines[guess + delta] === anchor)
+      return guess + delta;
+  }
+  return -1;
 }
 
 export const runCommandTool: RegisteredTool<{ command: string }, CommandResult> = {
@@ -922,59 +972,78 @@ export const searchCodeTool: RegisteredTool<
       if (filePattern) args.push("--glob", filePattern);
       args.push(query, absolutePath);
 
-      const raw = await runProcess(args, context);
-
-      // Parse ripgrep JSON output
-      const matches: SearchMatch[] = [];
-      for (const line of raw.stdout.split("\n")) {
-        if (!line.trim()) continue;
-        try {
-          const obj = JSON.parse(line) as RipgrepMessage;
-          if (obj.type === "match") {
-            const filePath = relative(context.repositoryPath, obj.data.path.text).replace(
-              /\\/g,
-              "/",
-            );
-            for (const subMatch of obj.data.submatches) {
-              matches.push({
-                file: filePath,
-                line: obj.data.line_number,
-                column: subMatch.start + 1,
-                text: obj.data.lines.text.trimEnd(),
-              });
-            }
-          }
-        } catch {
-          // not JSON (e.g. error output) — skip
-        }
+      // Attempt ripgrep. A missing binary makes Bun.spawn throw (ENOENT) or exit
+      // non-zero with a "not found" message — either way we fall back to a
+      // pure-JS search rather than surfacing a failure to the model.
+      let raw: CommandResult | null = null;
+      try {
+        raw = await runProcess(args, context);
+      } catch {
+        raw = null;
       }
 
-      // If ripgrep not available (any OS), fall back to plain text mode
-      const rgMissing =
-        raw.exitCode !== 0 &&
-        matches.length === 0 &&
-        (raw.stderr.includes("not found") ||
-          raw.stderr.includes("not recognized") ||
-          raw.stderr.includes("ENOENT") ||
-          raw.stderr.includes("No such file"));
-      if (rgMissing) {
-        // Fallback: manual text search
-        const fallbackMatches = await textSearch(
-          context.repositoryPath,
-          absolutePath,
-          query,
-          caseSensitive,
-          isRegex,
-          maxResults,
+      const matches: SearchMatch[] = [];
+      const rgUsable =
+        raw !== null &&
+        !(
+          raw.exitCode !== 0 &&
+          (raw.stderr.includes("not found") ||
+            raw.stderr.includes("not recognized") ||
+            raw.stderr.includes("ENOENT") ||
+            raw.stderr.includes("No such file or directory") ||
+            raw.stderr.includes("cannot find"))
         );
+
+      if (rgUsable && raw) {
+        // Parse ripgrep JSON output
+        for (const line of raw.stdout.split("\n")) {
+          if (!line.trim()) continue;
+          if (matches.length >= maxResults) break;
+          try {
+            const obj = JSON.parse(line) as RipgrepMessage;
+            if (obj.type === "match") {
+              const filePath = relative(context.repositoryPath, obj.data.path.text).replace(
+                /\\/g,
+                "/",
+              );
+              for (const subMatch of obj.data.submatches) {
+                matches.push({
+                  file: filePath,
+                  line: obj.data.line_number,
+                  column: subMatch.start + 1,
+                  text: obj.data.lines.text.trimEnd(),
+                });
+              }
+            }
+          } catch {
+            // not JSON (e.g. error output) — skip
+          }
+        }
+
+        const truncated = matches.length >= maxResults;
         return success<SearchResult>(
-          { matches: fallbackMatches, total: fallbackMatches.length, truncated: false },
+          { matches: matches.slice(0, maxResults), total: matches.length, truncated },
           startedAt,
         );
       }
 
-      const truncated = matches.length >= maxResults;
-      return success<SearchResult>({ matches, total: matches.length, truncated }, startedAt);
+      // Fallback: pure-JS text search (ripgrep unavailable).
+      const fallbackMatches = await textSearch(
+        context.repositoryPath,
+        absolutePath,
+        query,
+        caseSensitive,
+        isRegex,
+        maxResults,
+      );
+      return success<SearchResult>(
+        {
+          matches: fallbackMatches,
+          total: fallbackMatches.length,
+          truncated: fallbackMatches.length >= maxResults,
+        },
+        startedAt,
+      );
     } catch (error) {
       return failure(toMessage(error), startedAt);
     }
@@ -1390,13 +1459,61 @@ function resolveRepositoryPath(repositoryPath: string, requestedPath: string): s
   }
 
   const candidate = resolve(root, normalizedPath);
-  const relativePath = relative(root, candidate);
-  if (relativePath === "" || (!relativePath.startsWith(`..${sep}`) && relativePath !== "..")) {
-    return candidate;
+
+  // Reject absolute paths that resolve onto a different Windows drive or UNC
+  // share. `path.relative` returns the raw target (e.g. "D:\evil") in that
+  // case, which does NOT start with "..", so the string check below would
+  // wrongly accept it. Compare the filesystem roots explicitly.
+  if (parse(candidate).root.toLowerCase() !== parse(root).root.toLowerCase()) {
+    throw new Error(
+      `Path must remain within the repository root (${root}). Rejected path: ${candidate} (different filesystem root).`,
+    );
   }
-  throw new Error(
-    `Path must remain within the repository root (${root}). Rejected path: ${candidate}. Use a path relative to the repository root, e.g. "sandbox/todo.py".`,
-  );
+
+  assertWithinRoot(root, candidate);
+
+  // Defend against symlink escapes: resolve the real path of the candidate (or
+  // its nearest existing ancestor, for files not yet created) and re-check.
+  const real = realPathOrNearest(candidate);
+  if (real !== candidate) {
+    assertWithinRoot(realPathOrNearest(root), real);
+  }
+
+  return candidate;
+}
+
+/** Throw unless `candidate` is the root itself or a descendant of it (lexically). */
+function assertWithinRoot(root: string, candidate: string): void {
+  const relativePath = relative(root, candidate);
+  const inside =
+    relativePath === "" || (!relativePath.startsWith(`..${sep}`) && relativePath !== "..");
+  if (!inside) {
+    throw new Error(
+      `Path must remain within the repository root (${root}). Rejected path: ${candidate}. Use a path relative to the repository root, e.g. "sandbox/todo.py".`,
+    );
+  }
+}
+
+/**
+ * Return the canonical (symlink-resolved) path of `target`. When `target` does
+ * not exist yet (e.g. a write destination), resolve the closest existing
+ * ancestor and re-append the remaining segments, so a symlinked parent
+ * directory cannot be used to escape the repository root.
+ */
+function realPathOrNearest(target: string): string {
+  let current = target;
+  const trailing: string[] = [];
+  while (true) {
+    try {
+      const resolved = realpathSync(current);
+      return trailing.length > 0 ? join(resolved, ...trailing.reverse()) : resolved;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return target; // reached filesystem root; give up
+      trailing.push(basename(current));
+      current = parent;
+    }
+  }
 }
 
 function success<TData>(data: TData, startedAt: number): ToolResult<TData> {

@@ -1,11 +1,31 @@
 {
-  "name": "@forge/cli",
+  "name": "forge-ai",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
+  "description": "A modular, terminal-first AI coding agent",
+  "license": "MIT",
+  "author": "Forge Contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ayushwasnothere/forge",
+    "directory": "apps/cli"
+  },
+  "keywords": [
+    "ai",
+    "coding-agent",
+    "cli",
+    "llm",
+    "openai",
+    "anthropic",
+    "groq",
+    "ollama",
+    "terminal",
+    "code-generation"
+  ],
   "bin": {
     "forge": "./src/index.ts"
   },
+  "files": ["src/", "package.json", "README.md"],
   "scripts": {
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts"

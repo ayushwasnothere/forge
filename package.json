@@ -1,8 +1,16 @@
 {
-  "name": "forge",
+  "name": "forge-ai",
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "description": "A modular, terminal-first AI coding agent",
+  "license": "MIT",
+  "author": "Forge Contributors",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ayushwasnothere/forge"
+  },
+  "keywords": ["ai", "coding-agent", "cli", "llm", "openai", "anthropic", "terminal"],
   "workspaces": ["apps/*", "packages/*"],
   "scripts": {
     "dev": "bun --watch apps/cli/src/index.ts",
@@ -12,6 +20,9 @@
     "format": "biome format --write .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

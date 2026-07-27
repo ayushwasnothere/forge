@@ -1,11 +1,22 @@
+# Dependencies
 node_modules/
+
+# Environment
 .env
 .env.*
 !.env.example
+
+# Build & coverage
 coverage/
 dist/
+
+# Forge data
 .forge/
+
+# Logs & temp
 *.log
-context.md
-AGENTS.md
-sandbox
+*.tmp
+temp.txt
+
+# Sandbox workspace
+sandbox/

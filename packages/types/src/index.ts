@@ -105,4 +105,7 @@ export interface ModelToolCall {
   id: string;
   name: string;
   arguments: Record<string, unknown>;
+  thoughtSignature?: string;
+  extraContent?: Record<string, unknown>;
+  extraFields?: Record<string, unknown>;
 }

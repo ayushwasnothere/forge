@@ -1,10 +1,11 @@
 import { execSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   ToolRegistry,
+  applyPatchTool,
   findFilesTool,
   formatToolResult,
   gitCommitTool,
@@ -440,5 +441,125 @@ describe("ToolRegistry", () => {
     // No unstaged changes
     const status2 = await registry.execute("git_status", {}, { repositoryPath });
     expect((status2.data as { stdout: string }).stdout).not.toContain("README.md");
+  });
+});
+
+describe("apply_patch", () => {
+  const perm = { allowedPermissions: ["write" as const] };
+
+  function registry(): ToolRegistry {
+    const r = new ToolRegistry();
+    r.register(applyPatchTool);
+    return r;
+  }
+
+  it("applies a standard leading-context diff without corrupting the file", async () => {
+    const repositoryPath = await createRepository();
+    await writeFile(join(repositoryPath, "f.txt"), "line1\nline2\nline3\n", "utf8");
+
+    const patch = [
+      "--- a/f.txt",
+      "+++ b/f.txt",
+      "@@ -1,3 +1,3 @@",
+      " line1",
+      "-line2",
+      "+line2new",
+      " line3",
+      "",
+    ].join("\n");
+
+    const result = await registry().execute("apply_patch", { patch }, { repositoryPath, ...perm });
+    expect(result.success).toBe(true);
+    const content = await readFile(join(repositoryPath, "f.txt"), "utf8");
+    // The correct line was replaced; line1 and line3 are intact.
+    expect(content).toBe("line1\nline2new\nline3\n");
+  });
+
+  it("rejects the whole file when a removal line does not match (no partial write)", async () => {
+    const repositoryPath = await createRepository();
+    await writeFile(join(repositoryPath, "f.txt"), "alpha\nbeta\ngamma\n", "utf8");
+
+    const patch = [
+      "--- a/f.txt",
+      "+++ b/f.txt",
+      "@@ -1,3 +1,3 @@",
+      " alpha",
+      "-WRONG", // does not match "beta"
+      "+beta2",
+      " gamma",
+      "",
+    ].join("\n");
+
+    const result = await registry().execute("apply_patch", { patch }, { repositoryPath, ...perm });
+    const data = result.data as { hunksApplied: number; hunksRejected: number };
+    expect(data.hunksApplied).toBe(0);
+    expect(data.hunksRejected).toBeGreaterThan(0);
+    // File is untouched.
+    expect(await readFile(join(repositoryPath, "f.txt"), "utf8")).toBe("alpha\nbeta\ngamma\n");
+  });
+
+  it("does not split on content lines beginning with '--- '", async () => {
+    const repositoryPath = await createRepository();
+    await writeFile(join(repositoryPath, "d.txt"), "keep\n--- not a header\ntail\n", "utf8");
+
+    const patch = [
+      "--- a/d.txt",
+      "+++ b/d.txt",
+      "@@ -1,3 +1,3 @@",
+      " keep",
+      "---- not a header",
+      "+--- edited line",
+      " tail",
+      "",
+    ].join("\n");
+
+    const result = await registry().execute("apply_patch", { patch }, { repositoryPath, ...perm });
+    expect(result.success).toBe(true);
+    expect(await readFile(join(repositoryPath, "d.txt"), "utf8")).toBe(
+      "keep\n--- edited line\ntail\n",
+    );
+  });
+});
+
+describe("path confinement", () => {
+  it("rejects ../ escape attempts", async () => {
+    const repositoryPath = await createRepository();
+    const r = new ToolRegistry();
+    r.register(readFileTool);
+    const result = await r.execute("read_file", { path: "../secret.txt" }, { repositoryPath });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("within the repository root");
+  });
+
+  it("rejects reads through a symlink that points outside the repo", async () => {
+    const repositoryPath = await createRepository();
+    const outside = await mkdtemp(join(tmpdir(), "forge-outside-"));
+    await writeFile(join(outside, "secret.txt"), "TOP SECRET", "utf8");
+    try {
+      await symlink(outside, join(repositoryPath, "link"), "dir");
+    } catch {
+      return; // symlink creation may be denied (e.g. Windows without privilege) — skip
+    }
+    const r = new ToolRegistry();
+    r.register(readFileTool);
+    const result = await r.execute("read_file", { path: "link/secret.txt" }, { repositoryPath });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("within the repository root");
+  });
+});
+
+describe("find_files glob", () => {
+  it("matches root-level files with a **/ pattern", async () => {
+    const repositoryPath = await createRepository();
+    await writeFile(join(repositoryPath, "index.ts"), "export {};\n", "utf8");
+    await writeFile(join(repositoryPath, "src", "deep.ts"), "export {};\n", "utf8");
+
+    const r = new ToolRegistry();
+    r.register(findFilesTool);
+    const result = await r.execute("find_files", { pattern: "**/*.ts" }, { repositoryPath });
+    expect(result.success).toBe(true);
+    const files = (result.data as { files: string[] }).files;
+    expect(files).toContain("index.ts");
+    expect(files).toContain("src/deep.ts");
   });
 });
