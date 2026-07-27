@@ -2,7 +2,7 @@
   <h1>⚡ Forge</h1>
   <p>A modular, terminal-first AI coding agent built with TypeScript and Bun.</p>
 
-  <a href="https://www.npmjs.com/package/forge-ai"><img src="https://img.shields.io/npm/v/forge-ai.svg?style=flat-square" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/forge-code-ai"><img src="https://img.shields.io/npm/v/forge-code-ai.svg?style=flat-square" alt="npm version" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="license" /></a>
 </div>
 
